@@ -221,6 +221,53 @@ export function indicatorsToBlocklist(items: Indicator[]): string {
   return lines.join("\n");
 }
 
+function yamlStr(v: string): string {
+  return `'${v.replace(/'/g, "''")}'`;
+}
+
+/** Sigma detection rules (multi-doc YAML) grouped by IOC type, for SIEM detection. */
+export function indicatorsToSigma(items: Indicator[]): string {
+  const ips: string[] = [];
+  const domains: string[] = [];
+  const urls: string[] = [];
+  const hashes: string[] = [];
+  for (const i of items) {
+    if (i.type === "ip") ips.push(ipOnly(i.value));
+    else if (i.type === "domain") domains.push(i.value);
+    else if (i.type === "url") urls.push(i.value);
+    else if (i.type === "hash") hashes.push(i.value);
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const docs: string[] = [];
+  const rule = (title: string, logsource: string, field: string, values: string[], desc: string) => {
+    if (values.length === 0) return;
+    const uniq = [...new Set(values)].slice(0, 1000);
+    docs.push([
+      `title: ${title}`,
+      `id: ${uuid()}`,
+      `status: experimental`,
+      `description: ${desc}`,
+      `author: OmniSight`,
+      `date: ${today}`,
+      `logsource:`,
+      `  ${logsource}`,
+      `detection:`,
+      `  selection:`,
+      `    ${field}:`,
+      ...uniq.map((v) => `      - ${yamlStr(v)}`),
+      `  condition: selection`,
+      `level: high`,
+      `tags:`,
+      `  - attack.command_and_control`,
+    ].join("\n"));
+  };
+  rule("OmniSight - Malicious Destination IPs", "category: firewall", "dst_ip", ips, "IPs flagged by OmniSight threat intelligence");
+  rule("OmniSight - Malicious DNS Queries", "category: dns", "query", domains, "Domains flagged by OmniSight threat intelligence");
+  rule("OmniSight - Malicious URLs", "category: proxy", "c-uri", urls, "URLs flagged by OmniSight threat intelligence");
+  rule("OmniSight - Known Malicious File Hashes", "category: file_event", "Hashes", hashes, "File hashes flagged by OmniSight threat intelligence");
+  return docs.join("\n---\n") + "\n";
+}
+
 // --- Daily brief / digest --------------------------------------------------
 
 export type DigestTone = "critical" | "high" | "medium" | "low" | "info";

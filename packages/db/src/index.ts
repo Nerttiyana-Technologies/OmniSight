@@ -79,6 +79,15 @@ export interface MapIndicator {
   source: string;
 }
 
+export interface Correlation {
+  cveId: string;
+  title: string | null;   // populated when the CVE is also a tracked vulnerability
+  riskScore: number | null;
+  indicators: { value: string; source: string; malware: string | null; type: string }[];
+}
+
+const CVE_RE = /CVE-\d{4}-\d{4,}/gi;
+
 export interface AdvisoryListOptions {
   limit?: number;
   offset?: number;
@@ -120,6 +129,8 @@ export interface Repository {
   mapData(): Promise<MapPoint[]>;
   /** Individual geolocated indicators for one country (drill-down). */
   mapIndicators(country: string, limit?: number): Promise<MapIndicator[]>;
+  /** CVE references found inside indicators, linked to tracked CVEs where possible. */
+  cveCorrelations(limit?: number): Promise<Correlation[]>;
   upsertSource(source: Source): Promise<void>;
   listSources(): Promise<Source[]>;
   stats(): Promise<Stats>;
@@ -250,6 +261,28 @@ export class InMemoryRepository implements Repository {
       if (out.length >= limit) break;
     }
     return out;
+  }
+
+  async cveCorrelations(limit = 50): Promise<Correlation[]> {
+    const byCve = new Map<string, Correlation["indicators"]>();
+    for (const i of this.indicators.values()) {
+      const hay = `${i.value} ${i.malware ?? ""} ${i.threatType ?? ""} ${i.tags.join(" ")}`;
+      const found = hay.match(CVE_RE);
+      if (!found) continue;
+      for (const raw of found) {
+        const cve = raw.toUpperCase();
+        const arr = byCve.get(cve) ?? [];
+        if (arr.length < 25) arr.push({ value: i.value, source: i.source, malware: i.malware, type: i.type });
+        byCve.set(cve, arr);
+      }
+    }
+    const out: Correlation[] = [];
+    for (const [cveId, indicators] of byCve) {
+      const v = [...this.vulns.values()].find((x) => x.cveId === cveId);
+      out.push({ cveId, title: v?.title ?? null, riskScore: v?.riskScore ?? null, indicators });
+    }
+    out.sort((a, b) => (b.riskScore ?? -1) - (a.riskScore ?? -1) || b.indicators.length - a.indicators.length);
+    return out.slice(0, limit);
   }
 
   async pageIndicators(opts: IndicatorListOptions = {}): Promise<IndicatorPage> {
@@ -804,6 +837,43 @@ export class PostgresRepository implements Repository {
       type: r.type as string,
       source: r.source as string,
     }));
+  }
+
+  async cveCorrelations(limit = 50): Promise<Correlation[]> {
+    // Pull indicators that mention a CVE anywhere, then extract + join in JS.
+    const { rows } = await this.pool.query(
+      `SELECT value, source, malware, type, threat_type, tags FROM indicators
+         WHERE value ILIKE '%CVE-%' OR malware ILIKE '%CVE-%'
+            OR threat_type ILIKE '%CVE-%' OR tags::text ILIKE '%CVE-%'
+         LIMIT 5000`,
+    );
+    const byCve = new Map<string, Correlation["indicators"]>();
+    for (const r of rows) {
+      const tags = Array.isArray(r.tags) ? (r.tags as string[]).join(" ") : "";
+      const hay = `${r.value} ${r.malware ?? ""} ${r.threat_type ?? ""} ${tags}`;
+      const found = hay.match(CVE_RE);
+      if (!found) continue;
+      for (const raw of found) {
+        const cve = raw.toUpperCase();
+        const arr = byCve.get(cve) ?? [];
+        if (arr.length < 25) arr.push({ value: r.value, source: r.source, malware: r.malware ?? null, type: r.type });
+        byCve.set(cve, arr);
+      }
+    }
+    if (byCve.size === 0) return [];
+    const cves = [...byCve.keys()];
+    const { rows: vrows } = await this.pool.query(
+      `SELECT DISTINCT ON (cve_id) cve_id, title, risk_score FROM vulnerabilities
+         WHERE cve_id = ANY($1) ORDER BY cve_id, risk_score DESC`,
+      [cves],
+    );
+    const vmap = new Map(vrows.map((v) => [v.cve_id as string, { title: v.title as string, risk: v.risk_score as number }]));
+    const out: Correlation[] = cves.map((cveId) => {
+      const v = vmap.get(cveId);
+      return { cveId, title: v?.title ?? null, riskScore: v?.risk ?? null, indicators: byCve.get(cveId)! };
+    });
+    out.sort((a, b) => (b.riskScore ?? -1) - (a.riskScore ?? -1) || b.indicators.length - a.indicators.length);
+    return out.slice(0, limit);
   }
 
   async stats(): Promise<Stats> {

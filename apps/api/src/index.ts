@@ -4,7 +4,7 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import {
   NewSourceSchema, SourceSchema, type Source,
-  vulnerabilitiesToCsv, indicatorsToCsv, indicatorsToStix, indicatorsToBlocklist,
+  vulnerabilitiesToCsv, indicatorsToCsv, indicatorsToStix, indicatorsToBlocklist, indicatorsToSigma,
 } from "@omnisight/shared";
 import { createRepository, composeDigest } from "@omnisight/db";
 import {
@@ -84,6 +84,8 @@ app.get("/health", async () => ({ ok: true, store: usingPostgres ? "postgres" : 
 app.get("/api/stats", async () => repo.stats());
 
 app.get("/api/map", async () => repo.mapData());
+
+app.get("/api/correlations", async () => repo.cveCorrelations(50));
 
 app.get("/api/map/indicators", async (req) => {
   const code = (req.query as { code?: string }).code;
@@ -166,6 +168,12 @@ app.get("/api/indicators/export", async (req, reply) => {
       .header("content-type", "text/plain; charset=utf-8")
       .header("content-disposition", 'attachment; filename="omnisight-blocklist.txt"')
       .send(indicatorsToBlocklist(items));
+  }
+  if (format === "sigma") {
+    return reply
+      .header("content-type", "application/x-yaml; charset=utf-8")
+      .header("content-disposition", 'attachment; filename="omnisight-sigma.yml"')
+      .send(indicatorsToSigma(items));
   }
   return reply
     .header("content-type", "text/csv; charset=utf-8")

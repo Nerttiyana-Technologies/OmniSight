@@ -80,6 +80,13 @@ export interface MapIndicator {
   source: string;
 }
 
+export interface Correlation {
+  cveId: string;
+  title: string | null;
+  riskScore: number | null;
+  indicators: { value: string; source: string; malware: string | null; type: string }[];
+}
+
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json() as Promise<T>;
@@ -117,6 +124,7 @@ function iocQs(params: IndicatorQuery): string {
 export const api = {
   stats: () => fetch("/api/stats").then(json<Stats>),
   map: () => fetch("/api/map").then(json<MapPoint[]>),
+  correlations: () => fetch("/api/correlations").then(json<Correlation[]>),
   mapIndicators: (code: string) =>
     fetch(`/api/map/indicators?code=${encodeURIComponent(code)}`).then(json<MapIndicator[]>),
   digest: () => fetch("/api/digest").then(json<Digest>),

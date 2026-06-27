@@ -2,7 +2,9 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Queue, Worker, type Job } from "bullmq";
 import IORedis from "ioredis";
+import nodemailer from "nodemailer";
 import { createRepository, composeDigest } from "@omnisight/db";
+import type { Digest } from "@omnisight/shared";
 import {
   resolveConnector, resolveIndicatorConnector, resolveAdvisoryConnector,
   seedSources, fetchEpss, fetchNvdCvss, fetchGeo, sleep,
@@ -72,8 +74,38 @@ async function scheduleAll() {
     removeOnComplete: 5,
     removeOnFail: 5,
   });
+  // Opt-in: send one brief shortly after start to test the email setup.
+  if (process.env.DIGEST_ON_START === "true") {
+    await queue.add("digest", {}, { delay: 30000, jobId: "now-digest", removeOnComplete: true });
+  }
 
   console.log(`[worker] scheduled ${sources.length} source(s) + enrichment + daily brief`);
+}
+
+/** Email the daily brief if SMTP is configured (no-op otherwise). */
+async function sendDigestEmail(d: Digest): Promise<void> {
+  const host = process.env.SMTP_HOST?.trim();
+  const to = process.env.DIGEST_TO?.trim();
+  if (!host || !to) {
+    console.log("[worker] digest email: SMTP_HOST/DIGEST_TO not set — skipping send");
+    return;
+  }
+  const transport = nodemailer.createTransport({
+    host,
+    port: Number(process.env.SMTP_PORT ?? 587),
+    secure: process.env.SMTP_SECURE === "true",
+    auth: process.env.SMTP_USER
+      ? { user: process.env.SMTP_USER.trim(), pass: (process.env.SMTP_PASS ?? "").trim() }
+      : undefined,
+  });
+  await transport.sendMail({
+    from: process.env.SMTP_FROM?.trim() || process.env.SMTP_USER?.trim() || "omnisight@localhost",
+    to,
+    subject: `OmniSight Daily Brief — ${d.date}`,
+    html: d.html,
+    text: d.markdown,
+  });
+  console.log(`[worker] digest email sent to ${to}`);
 }
 
 let enrichRunning = false;
@@ -170,6 +202,7 @@ new Worker(
     if (job.name === "digest") {
       const d = await composeDigest(repo);
       console.log(`[worker] daily brief — ${d.headline}`);
+      await sendDigestEmail(d).catch((e) => console.warn(`[worker] digest email failed: ${(e as Error).message}`));
       return { ok: true };
     }
     const source = (await repo.listSources()).find((s) => s.id === job.data.sourceId);

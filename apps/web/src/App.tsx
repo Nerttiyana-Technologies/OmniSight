@@ -9,6 +9,7 @@ import {
 } from "@omnisight/shared";
 import {
   api, type Stats, type VulnQuery, type IndicatorQuery, type AdvisoryQuery, type MapPoint, type MapIndicator,
+  type Correlation,
 } from "./api.ts";
 import { makeProjector, topologyToGeometries, geomToPath, type Geom } from "./geo.ts";
 
@@ -37,6 +38,18 @@ function download(url: string) {
   document.body.appendChild(a);
   a.click();
   a.remove();
+}
+
+/** Download in-memory content as a file (no navigation). */
+function downloadBlob(filename: string, content: string, type: string) {
+  const url = URL.createObjectURL(new Blob([content], { type }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 /** Client-side "in my stack" check (mirrors the server's matching). */
@@ -541,10 +554,26 @@ function MapView({ reloadKey }: { reloadKey: number }) {
 
 function Overview({ reloadKey, stats }: { reloadKey: number; stats: Stats | null }) {
   const [digest, setDigest] = useState<Digest | null>(null);
+  const [correlations, setCorrelations] = useState<Correlation[]>([]);
+  const [preview, setPreview] = useState<null | "html" | "md">(null);
 
   useEffect(() => {
     api.digest().then(setDigest).catch(() => {});
+    api.correlations().then(setCorrelations).catch(() => {});
   }, [reloadKey]);
+
+  // While the preview modal is open: Esc closes it and the background is locked.
+  useEffect(() => {
+    if (!preview) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setPreview(null); };
+    window.addEventListener("keydown", onKey);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [preview]);
 
   const tl = stats ? threatLevel(stats) : null;
 
@@ -567,11 +596,11 @@ function Overview({ reloadKey, stats }: { reloadKey: number; stats: Stats | null
           <h2>Daily Brief{digest && <span className="muted"> · {digest.date}</span>}</h2>
         </div>
         <div className="spacer" />
-        <button className="chip" onClick={() => window.open(api.digestUrl("html"), "_blank")} title="Open the HTML email brief">
-          <FileText size={14} /> Open email
+        <button className="chip" onClick={() => setPreview("html")} title="Preview the HTML email brief" disabled={!digest}>
+          <FileText size={14} /> Email preview
         </button>
-        <button className="chip" onClick={() => download(api.digestUrl("md"))} title="Download as Markdown">
-          <Download size={14} /> Markdown
+        <button className="chip" onClick={() => setPreview("md")} title="View the Markdown brief" disabled={!digest}>
+          <FileText size={14} /> Markdown
         </button>
       </div>
 
@@ -596,6 +625,64 @@ function Overview({ reloadKey, stats }: { reloadKey: number; stats: Stats | null
         ))}
         {!digest && <div className="muted" style={{ padding: 20 }}>Loading brief… (start the API to populate)</div>}
       </div>
+
+      <div className="section-head" style={{ marginTop: 24 }}>
+        <h2>Cross-Source Correlations</h2>
+      </div>
+      <div className="panel" style={{ padding: 16 }}>
+        {correlations.length === 0 ? (
+          <div className="muted ov-empty">
+            No CVE references found in current indicators yet. IOC feeds only sometimes cite CVEs — links appear here when they do.
+          </div>
+        ) : (
+          correlations.map((c) => (
+            <div className="ov-row" key={c.cveId}>
+              <span className={`badge ${c.riskScore != null ? riskBand(c.riskScore) : "info"}`}>
+                {c.riskScore != null ? c.riskScore : "—"}
+              </span>
+              <div className="ov-row-text">
+                <div className="ov-primary">
+                  <span className="cve">{c.cveId}</span>
+                  {c.title ? ` — ${c.title}` : <span className="muted"> (not in tracked CVEs)</span>}
+                </div>
+                <div className="muted ov-secondary">
+                  {c.indicators.length} related indicator{c.indicators.length === 1 ? "" : "s"}
+                  {c.indicators[0] && ` · e.g. ${c.indicators[0].value}${c.indicators[0].malware ? ` (${c.indicators[0].malware})` : ""}`}
+                </div>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+
+      {preview && digest && (
+        <div className="modal-backdrop" onClick={() => setPreview(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="modal-title">Daily Brief · {digest.date}</div>
+              <div className="spacer" />
+              <button
+                className="chip"
+                onClick={() =>
+                  preview === "html"
+                    ? downloadBlob("omnisight-brief.html", digest.html, "text/html")
+                    : downloadBlob("omnisight-brief.md", digest.markdown, "text/markdown")
+                }
+              >
+                <Download size={14} /> Download
+              </button>
+              <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={() => setPreview(null)}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="modal-body">
+              {preview === "html"
+                ? <iframe className="brief-frame" srcDoc={digest.html} title="Daily brief email" />
+                : <pre className="brief-md">{digest.markdown}</pre>}
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
@@ -842,6 +929,9 @@ function IndicatorGrid({ reloadKey, sources }: { reloadKey: number; sources: Sou
         </button>
         <button className="chip" onClick={() => download(api.exportIndicatorUrl(exportParams(), "blocklist"))} title="Plain blocklist for firewalls/IDS">
           Blocklist
+        </button>
+        <button className="chip" onClick={() => download(api.exportIndicatorUrl(exportParams(), "sigma"))} title="Sigma detection rules (SIEM)">
+          Sigma
         </button>
       </div>
       <table>
