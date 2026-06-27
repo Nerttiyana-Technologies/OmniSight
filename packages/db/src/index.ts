@@ -14,6 +14,7 @@ export interface ListOptions {
   source?: string;
   exploited?: boolean;
   ransomware?: boolean;
+  terms?: string[]; // "My Stack" — match vendor/product/title against any term
   sort?: string; // risk | cve | threat | vendor | cvss | epss | source
   dir?: "asc" | "desc";
 }
@@ -31,6 +32,7 @@ export interface Stats {
   high: number;
   sources: number;
   indicators: number;
+  inStack: number;
 }
 
 export interface IndicatorListOptions {
@@ -65,6 +67,9 @@ export interface Repository {
   page(opts?: ListOptions): Promise<Page>;
   upsertIndicators(items: Indicator[]): Promise<number>;
   pageIndicators(opts?: IndicatorListOptions): Promise<IndicatorPage>;
+  listWatchlist(): Promise<string[]>;
+  addWatchTerm(term: string): Promise<void>;
+  removeWatchTerm(term: string): Promise<void>;
   upsertSource(source: Source): Promise<void>;
   listSources(): Promise<Source[]>;
   stats(): Promise<Stats>;
@@ -87,13 +92,32 @@ export function createRepository(databaseUrl = process.env.DATABASE_URL): Reposi
 
 // ---------------------------------------------------------------------------
 
+/** True if a vulnerability matches any "My Stack" term (vendor/product/title). */
+export function matchesTerms(v: Vulnerability, terms: string[]): boolean {
+  if (terms.length === 0) return false;
+  const hay = `${v.vendor ?? ""} ${v.product ?? ""} ${v.title}`.toLowerCase();
+  return terms.some((t) => hay.includes(t.toLowerCase()));
+}
+
 export class InMemoryRepository implements Repository {
   private vulns = new Map<string, Vulnerability>();
   private indicators = new Map<string, Indicator>();
   private sources = new Map<string, Source>();
+  private watch = new Set<string>();
   private bus = new EventEmitter();
 
   async init(): Promise<void> {}
+
+  async listWatchlist(): Promise<string[]> {
+    return [...this.watch];
+  }
+  async addWatchTerm(term: string): Promise<void> {
+    const t = term.trim().toLowerCase();
+    if (t) this.watch.add(t);
+  }
+  async removeWatchTerm(term: string): Promise<void> {
+    this.watch.delete(term.trim().toLowerCase());
+  }
 
   async upsertIndicators(items: Indicator[]): Promise<number> {
     for (const i of items) this.indicators.set(`${i.source}:${i.id}`, i);
@@ -189,6 +213,7 @@ export class InMemoryRepository implements Repository {
     if (opts.source) rows = rows.filter((v) => v.source === opts.source);
     if (opts.exploited) rows = rows.filter((v) => v.knownExploited);
     if (opts.ransomware) rows = rows.filter((v) => v.ransomwareUse);
+    if (opts.terms && opts.terms.length) rows = rows.filter((v) => matchesTerms(v, opts.terms!));
     if (opts.vendor) {
       const vq = opts.vendor.toLowerCase();
       rows = rows.filter(
@@ -254,6 +279,7 @@ export class InMemoryRepository implements Repository {
 
   async stats(): Promise<Stats> {
     const rows = [...this.vulns.values()];
+    const terms = [...this.watch];
     return {
       total: rows.length,
       knownExploited: rows.filter((v) => v.knownExploited).length,
@@ -262,6 +288,7 @@ export class InMemoryRepository implements Repository {
       high: rows.filter((v) => v.riskScore >= 50 && v.riskScore < 75).length,
       sources: this.sources.size,
       indicators: this.indicators.size,
+      inStack: terms.length ? rows.filter((v) => matchesTerms(v, terms)).length : 0,
     };
   }
 }
@@ -346,6 +373,19 @@ export class PostgresRepository implements Repository {
     await this.pool.query(sql);
   }
 
+  async listWatchlist(): Promise<string[]> {
+    const { rows } = await this.pool.query(`SELECT term FROM watchlist ORDER BY term`);
+    return rows.map((r) => r.term as string);
+  }
+  async addWatchTerm(term: string): Promise<void> {
+    const t = term.trim().toLowerCase();
+    if (!t) return;
+    await this.pool.query(`INSERT INTO watchlist (term) VALUES ($1) ON CONFLICT DO NOTHING`, [t]);
+  }
+  async removeWatchTerm(term: string): Promise<void> {
+    await this.pool.query(`DELETE FROM watchlist WHERE term = $1`, [term.trim().toLowerCase()]);
+  }
+
   async upsertSource(s: Source): Promise<void> {
     await this.pool.query(
       `INSERT INTO sources (id,name,kind,signal_type,url,schedule,enabled,requires_auth,config)
@@ -425,6 +465,14 @@ export class PostgresRepository implements Repository {
     if (opts.vendor) {
       params.push(`%${opts.vendor}%`);
       where.push(`(vendor ILIKE $${params.length} OR product ILIKE $${params.length})`);
+    }
+    if (opts.terms && opts.terms.length) {
+      const ors = opts.terms.map((t) => {
+        params.push(`%${t}%`);
+        const p = `$${params.length}`;
+        return `(vendor ILIKE ${p} OR product ILIKE ${p} OR title ILIKE ${p})`;
+      });
+      where.push(`(${ors.join(" OR ")})`);
     }
     if (opts.q) {
       params.push(`%${opts.q}%`);
@@ -544,6 +592,24 @@ export class PostgresRepository implements Repository {
        FROM vulnerabilities`,
     );
     const r = rows[0];
+
+    // "In stack" depends on the watchlist terms, so count it separately.
+    const terms = await this.listWatchlist();
+    let inStack = 0;
+    if (terms.length) {
+      const params: unknown[] = [];
+      const ors = terms.map((t) => {
+        params.push(`%${t}%`);
+        const p = `$${params.length}`;
+        return `(vendor ILIKE ${p} OR product ILIKE ${p} OR title ILIKE ${p})`;
+      });
+      const res = await this.pool.query(
+        `SELECT COUNT(*)::int AS n FROM vulnerabilities WHERE ${ors.join(" OR ")}`,
+        params,
+      );
+      inStack = res.rows[0].n as number;
+    }
+
     return {
       total: r.total,
       knownExploited: r.known_exploited,
@@ -552,6 +618,7 @@ export class PostgresRepository implements Repository {
       high: r.high,
       sources: r.sources,
       indicators: r.indicators,
+      inStack,
     };
   }
 }

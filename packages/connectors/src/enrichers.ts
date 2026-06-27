@@ -86,7 +86,8 @@ export async function fetchNvdCvss(
       }
       throw new Error(`NVD fetch failed for ${cveId}: HTTP ${res.status}`);
     }
-    if (!res || !res.ok) throw new Error(`NVD fetch failed for ${cveId}: HTTP ${res?.status ?? "no response"}`);
+    // Exhausted 429/503 retries — skip quietly; the CVE is picked up next cycle.
+    if (!res || !res.ok) return null;
     payload = await res.json();
   }
   return extractCvss(payload);

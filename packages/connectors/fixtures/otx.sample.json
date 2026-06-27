@@ -1,0 +1,26 @@
+{
+  "results": [
+    {
+      "id": "pulse-aaa",
+      "name": "Emotet Campaign June 2026",
+      "tags": ["emotet", "banking-trojan"],
+      "created": "2026-06-20T00:00:00",
+      "modified": "2026-06-26T00:00:00",
+      "references": ["https://otx.alienvault.com/pulse/pulse-aaa"],
+      "indicators": [
+        { "indicator": "203.0.113.55", "type": "IPv4", "created": "2026-06-20T01:00:00" },
+        { "indicator": "evil-otx.example.com", "type": "domain", "created": "2026-06-21T01:00:00" },
+        { "indicator": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "type": "FileHash-SHA256", "created": "2026-06-22T01:00:00" }
+      ]
+    },
+    {
+      "id": "pulse-bbb",
+      "name": "Phishing Kit Infrastructure",
+      "tags": ["phishing"],
+      "modified": "2026-06-25T00:00:00",
+      "indicators": [
+        { "indicator": "http://phish-otx.example/login", "type": "URL" }
+      ]
+    }
+  ]
+}
