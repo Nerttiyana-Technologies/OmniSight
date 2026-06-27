@@ -104,6 +104,7 @@ new Worker(
     const credentials = {
       authKey: process.env.ABUSECH_AUTH_KEY?.trim() || undefined,
       nvdApiKey: process.env.NVD_API_KEY?.trim() || undefined,
+      otxApiKey: process.env.OTX_API_KEY?.trim() || undefined,
     };
 
     if (source.signalType === "indicator") {

@@ -27,9 +27,17 @@ records are keyed on `(source, id)` so each is preserved, and enrichment applies
 to all of them — the seed of cross-source correlation.
 
 Beyond vulnerabilities, OmniSight also ingests **indicators of compromise** via
-the **abuse.ch ThreatFox** connector (IPs, domains, URLs, hashes with malware
-context — needs `ABUSECH_AUTH_KEY`). The dashboard has a **Vulnerabilities** and
-an **Indicators** tab, each with its own filter/sort/paginate grid.
+the **abuse.ch ThreatFox** and **AlienVault OTX** connectors (IPs, domains, URLs,
+hashes with malware context — need `ABUSECH_AUTH_KEY` / `OTX_API_KEY`). The
+dashboard has a **Vulnerabilities** and an **Indicators** tab, each with its own
+filter/sort/paginate grid.
+
+### My Stack
+
+Declare the vendors and products you run (the **My Stack** panel). CVEs whose
+vendor, product, or title match are flagged in the grid, filterable with
+"My Stack only", and counted in a dedicated stat card — turning the global feed
+into "what affects *us*". Matching is server-side, so it scales and paginates.
 
 ### Real-time & enrichment
 

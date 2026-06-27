@@ -3,12 +3,14 @@ import type { Connector, IndicatorConnector } from "./types.js";
 import { cisaKevConnector } from "./cisa-kev.js";
 import { nvdConnector } from "./nvd.js";
 import { threatfoxConnector } from "./threatfox.js";
+import { otxConnector } from "./otx.js";
 import { makeGenericJsonConnector } from "./generic-json.js";
 
 export * from "./types.js";
 export { cisaKevConnector, normalizeKev } from "./cisa-kev.js";
 export { nvdConnector, normalizeNvd } from "./nvd.js";
 export { threatfoxConnector, normalizeThreatfox } from "./threatfox.js";
+export { otxConnector, normalizeOtx } from "./otx.js";
 export { makeGenericJsonConnector } from "./generic-json.js";
 export {
   fetchEpss, parseEpss, fetchNvdCvss, extractCvss, cvssFromMetrics, sleep, type EpssResult,
@@ -23,6 +25,7 @@ export const builtinConnectors: Record<string, Connector> = {
 /** Built-in indicator connectors, keyed by source slug. */
 export const builtinIndicatorConnectors: Record<string, IndicatorConnector> = {
   [threatfoxConnector.id]: threatfoxConnector,
+  [otxConnector.id]: otxConnector,
 };
 
 export function resolveIndicatorConnector(source: Source): IndicatorConnector {
@@ -73,6 +76,17 @@ export const seedSources: Source[] = [
     signalType: "indicator",
     url: null,
     schedule: "0 */2 * * *",
+    enabled: true,
+    requiresAuth: true,
+    config: {},
+  },
+  {
+    id: "otx",
+    name: "AlienVault OTX",
+    kind: "builtin",
+    signalType: "indicator",
+    url: null,
+    schedule: "0 */3 * * *",
     enabled: true,
     requiresAuth: true,
     config: {},

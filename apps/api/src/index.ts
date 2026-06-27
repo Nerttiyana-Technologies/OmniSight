@@ -83,6 +83,7 @@ app.get("/api/vulnerabilities", async (req) => {
   const q = req.query as Record<string, string | undefined>;
   const page = Math.max(1, Number(q.page ?? 1));
   const pageSize = Math.min(200, Math.max(1, Number(q.pageSize ?? 50)));
+  const terms = q.myStack === "true" ? await repo.listWatchlist() : undefined;
   const result = await repo.page({
     limit: pageSize,
     offset: (page - 1) * pageSize,
@@ -92,6 +93,7 @@ app.get("/api/vulnerabilities", async (req) => {
     source: q.source || undefined,
     exploited: q.exploited === "true" ? true : undefined,
     ransomware: q.ransomware === "true" ? true : undefined,
+    terms,
     sort: q.sort || undefined,
     dir: q.dir === "asc" ? "asc" : q.dir === "desc" ? "desc" : undefined,
   });
@@ -113,6 +115,24 @@ app.get("/api/indicators", async (req) => {
     dir: q.dir === "asc" ? "asc" : q.dir === "desc" ? "desc" : undefined,
   });
   return { ...result, page, pageSize };
+});
+
+// --- My Stack watchlist ---
+app.get("/api/watchlist", async () => repo.listWatchlist());
+
+app.post("/api/watchlist", async (req, reply) => {
+  const body = req.body as { term?: string };
+  if (!body.term || !body.term.trim()) return reply.status(400).send({ error: "term required" });
+  await repo.addWatchTerm(body.term);
+  await repo.signalChange("watchlist");
+  return repo.listWatchlist();
+});
+
+app.delete("/api/watchlist/:term", async (req) => {
+  const { term } = req.params as { term: string };
+  await repo.removeWatchTerm(decodeURIComponent(term));
+  await repo.signalChange("watchlist");
+  return repo.listWatchlist();
 });
 
 app.get("/api/sources", async () => repo.listSources());
@@ -143,7 +163,10 @@ app.post("/api/sources/:id/run", async (req, reply) => {
     if (source.signalType === "indicator") {
       const connector = resolveIndicatorConnector(source);
       const iocs = await connector.fetchIndicators({
-        credentials: { authKey: process.env.ABUSECH_AUTH_KEY?.trim() || undefined },
+        credentials: {
+          authKey: process.env.ABUSECH_AUTH_KEY?.trim() || undefined,
+          otxApiKey: process.env.OTX_API_KEY?.trim() || undefined,
+        },
       });
       const n = await repo.upsertIndicators(iocs);
       await repo.signalChange(id);

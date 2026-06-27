@@ -37,6 +37,7 @@ export interface VulnQuery {
   source?: string;
   exploited?: boolean;
   ransomware?: boolean;
+  myStack?: boolean;
   sort?: string;
   dir?: "asc" | "desc";
 }
@@ -65,6 +66,7 @@ export const api = {
     if (params.source) qs.set("source", params.source);
     if (params.exploited) qs.set("exploited", "true");
     if (params.ransomware) qs.set("ransomware", "true");
+    if (params.myStack) qs.set("myStack", "true");
     if (params.sort) qs.set("sort", params.sort);
     if (params.dir) qs.set("dir", params.dir);
     return fetch(`/api/vulnerabilities?${qs}`).then(json<VulnPage>);
@@ -90,6 +92,15 @@ export const api = {
     if (params.dir) qs.set("dir", params.dir);
     return fetch(`/api/indicators?${qs}`).then(json<IndicatorPage>);
   },
+  watchlist: () => fetch("/api/watchlist").then(json<string[]>),
+  addWatch: (term: string) =>
+    fetch("/api/watchlist", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ term }),
+    }).then(json<string[]>),
+  removeWatch: (term: string) =>
+    fetch(`/api/watchlist/${encodeURIComponent(term)}`, { method: "DELETE" }).then(json<string[]>),
   enrich: () => fetch("/api/enrich", { method: "POST" }).then(json<{ enriched: number }>),
   /** Open the SSE stream. Returns the EventSource so callers can close it. */
   stream: (onUpdate: () => void, onError: () => void): EventSource => {

@@ -133,6 +133,35 @@ main { width: 100%; margin: 0; padding: 28px 40px; }
 .badge.ioc-other { background: var(--bg-elev-2); color: var(--text-muted); }
 .ioc-value { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 13px; word-break: break-all; max-width: 360px; }
 
+/* My Stack */
+.grid-toolbar { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 12px; border-radius: 999px; border: 1px solid var(--border);
+  background: var(--bg-elev-2); color: var(--text); font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.chip:hover:not(:disabled) { border-color: var(--accent); }
+.chip:disabled { opacity: 0.5; cursor: not-allowed; }
+.chip.on { background: var(--accent); color: #0b0f17; border-color: var(--accent); }
+.chip.on .muted { color: #0b0f17; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.chip.removable { cursor: default; }
+.chip.removable button {
+  display: inline-flex; align-items: center; justify-content: center;
+  background: none; border: none; color: var(--text-muted); cursor: pointer; padding: 0; margin-left: 2px;
+}
+.chip.removable button:hover { color: var(--critical); }
+.stack-add { display: flex; gap: 10px; max-width: 420px; }
+.stack-add input {
+  flex: 1; padding: 9px 11px; border-radius: 9px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 14px;
+}
+.stack-add input:focus { outline: none; border-color: var(--accent); }
+
+tr.in-stack td { background: var(--accent-soft); }
+tr.in-stack:hover td { background: var(--accent-soft); }
+.stack-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); margin-right: 7px; vertical-align: middle; }
+
 .panel { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); overflow: hidden; }
 
 table { width: 100%; border-collapse: collapse; }

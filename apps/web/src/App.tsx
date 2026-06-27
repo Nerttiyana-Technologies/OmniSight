@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   Radar, Moon, Sun, RefreshCw, Plus, ShieldAlert, Skull, Flame, Database, TrendingUp, Rss,
-  Activity, Gauge, ChevronLeft, ChevronRight, Crosshair,
+  Activity, Gauge, ChevronLeft, ChevronRight, Crosshair, Server, X,
 } from "lucide-react";
 import {
   riskBand, type Vulnerability, type Indicator, type NewSource, type Source,
@@ -23,12 +23,21 @@ function formatDate(s: string | null): string {
   return `${MONTHS[d.getMonth()]}/${String(d.getDate()).padStart(2, "0")}/${d.getFullYear()}`;
 }
 
+/** Client-side "in my stack" check (mirrors the server's matching). */
+function inStack(v: Vulnerability, terms: string[]): boolean {
+  if (!terms.length) return false;
+  const hay = `${v.vendor ?? ""} ${v.product ?? ""} ${v.title}`.toLowerCase();
+  return terms.some((t) => hay.includes(t.toLowerCase()));
+}
+
 export function App() {
   const [theme, setTheme] = useState<Theme>("dark");
   const [stats, setStats] = useState<Stats | null>(null);
   const [tab, setTab] = useState<Tab>("vulns");
   const [sources, setSources] = useState<Source[]>([]);
+  const [terms, setTerms] = useState<string[]>([]);
   const [showAdd, setShowAdd] = useState(false);
+  const [showStack, setShowStack] = useState(false);
   const [live, setLive] = useState(true);
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
@@ -44,9 +53,10 @@ export function App() {
     api.sources().then(setSources).catch(() => {});
   }, []);
 
-  // Stats follow every reload (manual, SSE push, or poll).
+  // Stats + watchlist follow every reload (manual, SSE push, or poll).
   useEffect(() => {
     api.stats().then((s) => { setStats(s); setUpdatedAt(new Date()); }).catch(() => {});
+    api.watchlist().then(setTerms).catch(() => {});
   }, [reloadKey]);
 
   // Real-time: SSE push bumps reloadKey; fall back to polling if the stream drops.
@@ -102,6 +112,14 @@ export function App() {
         </button>
         <button
           className="icon-btn"
+          data-tooltip="My Stack"
+          aria-label="My Stack"
+          onClick={() => setShowStack((v) => !v)}
+        >
+          <Server size={18} />
+        </button>
+        <button
+          className="icon-btn"
           data-tooltip="Add feed (admin)"
           aria-label="Add feed"
           onClick={() => setShowAdd((v) => !v)}
@@ -129,9 +147,11 @@ export function App() {
           <StatCard icon={<Flame size={16} />} label="Critical (75+)" value={stats?.critical} crit />
           <StatCard icon={<TrendingUp size={16} />} label="High (50–74)" value={stats?.high} />
           <StatCard icon={<Crosshair size={16} />} label="Indicators" value={stats?.indicators} />
+          <StatCard icon={<Server size={16} />} label="My Stack" value={stats?.inStack} accent />
           <StatCard icon={<Rss size={16} />} label="Active Sources" value={stats?.sources} />
         </section>
 
+        {showStack && <StackPanel terms={terms} onChange={bump} />}
         {showAdd && <AddFeed onAdded={bump} />}
 
         <div className="tabs">
@@ -144,7 +164,7 @@ export function App() {
         </div>
 
         {tab === "vulns"
-          ? <VulnGrid reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "vulnerability")} />
+          ? <VulnGrid reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "vulnerability")} terms={terms} />
           : <IndicatorGrid reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "indicator")} />}
       </main>
     </>
@@ -160,10 +180,11 @@ interface VulnFilters {
   source: string;
   minRisk: number;
   flag: "" | "exploited" | "ransomware";
+  myStack: boolean;
 }
-const EMPTY_VULN_FILTERS: VulnFilters = { q: "", vendor: "", source: "", minRisk: 0, flag: "" };
+const EMPTY_VULN_FILTERS: VulnFilters = { q: "", vendor: "", source: "", minRisk: 0, flag: "", myStack: false };
 
-function VulnGrid({ reloadKey, sources }: { reloadKey: number; sources: Source[] }) {
+function VulnGrid({ reloadKey, sources, terms }: { reloadKey: number; sources: Source[]; terms: string[] }) {
   const [items, setItems] = useState<Vulnerability[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -187,6 +208,7 @@ function VulnGrid({ reloadKey, sources }: { reloadKey: number; sources: Source[]
       if (filters.minRisk) q.minRisk = filters.minRisk;
       if (filters.flag === "exploited") q.exploited = true;
       if (filters.flag === "ransomware") q.ransomware = true;
+      if (filters.myStack) q.myStack = true;
       const p = await api.vulnerabilities(q);
       setItems(p.items); setTotal(p.total);
     } catch { /* offline */ } finally { setLoading(false); }
@@ -209,6 +231,18 @@ function VulnGrid({ reloadKey, sources }: { reloadKey: number; sources: Source[]
 
   return (
     <div className="panel">
+      <div className="grid-toolbar">
+        <button
+          className={`chip ${filters.myStack ? "on" : ""}`}
+          onClick={() => setFilter("myStack", !filters.myStack)}
+          disabled={terms.length === 0}
+          title={terms.length === 0 ? "Add software to My Stack first" : "Show only CVEs affecting your stack"}
+        >
+          <Server size={14} /> My Stack only
+          {terms.length > 0 && <span className="muted"> ({terms.length})</span>}
+        </button>
+        {terms.length === 0 && <span className="muted">Add software via the My Stack panel to filter by what you run.</span>}
+      </div>
       <table>
         <thead>
           <tr>
@@ -261,15 +295,19 @@ function VulnGrid({ reloadKey, sources }: { reloadKey: number; sources: Source[]
           )}
           {items.map((v) => {
             const band = riskBand(v.riskScore);
+            const mine = inStack(v, terms);
             return (
-              <tr key={`${v.source}:${v.id}`}>
+              <tr key={`${v.source}:${v.id}`} className={mine ? "in-stack" : ""}>
                 <td>
                   <div className="risk-cell">
                     <span className={`badge ${band}`}>{v.riskScore}</span>
                     <div className="risk-bar"><span style={{ width: `${v.riskScore}%`, background: `var(--${band})` }} /></div>
                   </div>
                 </td>
-                <td className="cve">{v.cveId ?? v.id}</td>
+                <td className="cve">
+                  {mine && <span className="stack-dot" title="In your stack" />}
+                  {v.cveId ?? v.id}
+                </td>
                 <td>{v.title}</td>
                 <td className="muted">{[v.vendor, v.product].filter(Boolean).join(" / ") || "—"}</td>
                 <td className="muted">{v.cvss != null ? v.cvss.toFixed(1) : "—"}</td>
@@ -439,6 +477,43 @@ function StatCard(props: { icon: React.ReactNode; label: string; value?: number;
         {props.icon} {props.label}
       </div>
       <div className="value">{props.value ?? "—"}</div>
+    </div>
+  );
+}
+
+function StackPanel({ terms, onChange }: { terms: string[]; onChange: () => void }) {
+  const [term, setTerm] = useState("");
+
+  async function add(e: FormEvent) {
+    e.preventDefault();
+    if (!term.trim()) return;
+    try { await api.addWatch(term.trim()); setTerm(""); onChange(); } catch { /* offline */ }
+  }
+  async function remove(t: string) {
+    try { await api.removeWatch(t); onChange(); } catch { /* offline */ }
+  }
+
+  return (
+    <div className="panel drawer">
+      <div className="section-head"><h2>My Stack</h2></div>
+      <div className="hint" style={{ marginTop: 0, marginBottom: 12 }}>
+        Add the vendors and products you run. CVEs matching these are flagged in the grid and filterable with “My Stack only”.
+      </div>
+      <div className="chips">
+        {terms.length === 0 && (
+          <span className="muted">No software yet — try “fortinet”, “log4j”, “windows”, “cisco”.</span>
+        )}
+        {terms.map((t) => (
+          <span key={t} className="chip removable">
+            {t}
+            <button onClick={() => remove(t)} aria-label={`Remove ${t}`}><X size={12} /></button>
+          </span>
+        ))}
+      </div>
+      <form onSubmit={add} className="stack-add">
+        <input value={term} onChange={(e) => setTerm(e.target.value)} placeholder="e.g. fortinet" />
+        <button className="btn-primary" type="submit"><Plus size={16} /> Add</button>
+      </form>
     </div>
   );
 }
