@@ -1,4 +1,4 @@
-import type { Source, Vulnerability, Indicator } from "@omnisight/shared";
+import type { Source, Vulnerability, Indicator, Advisory } from "@omnisight/shared";
 
 export interface FetchOptions {
   /** When provided, the connector parses this instead of hitting the network (used for tests/dry-runs). */
@@ -30,4 +30,12 @@ export interface IndicatorConnector {
   name: string;
   schedule: string;
   fetchIndicators(opts?: FetchOptions): Promise<Indicator[]>;
+}
+
+/** A connector that produces news/advisory items. */
+export interface AdvisoryConnector {
+  id: string;
+  name: string;
+  schedule: string;
+  fetchAdvisories(opts?: FetchOptions): Promise<Advisory[]>;
 }

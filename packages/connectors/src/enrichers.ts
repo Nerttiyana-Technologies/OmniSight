@@ -114,3 +114,46 @@ export function extractCvss(payload: unknown): number | null {
 
 /** Throttle helper so the NVD loop respects the rate limit. */
 export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+// --- Geolocation (ipwho.is — keyless, HTTPS) -------------------------------
+
+export interface GeoResult {
+  country: string | null;
+  countryCode: string | null;
+  lat: number | null;
+  lng: number | null;
+}
+
+interface IpWhoIsPayload {
+  success?: boolean;
+  country?: string;
+  country_code?: string;
+  latitude?: number;
+  longitude?: number;
+}
+
+export function parseGeo(payload: unknown): GeoResult | null {
+  const p = payload as IpWhoIsPayload;
+  if (!p || p.success === false) return null;
+  if (typeof p.latitude !== "number" || typeof p.longitude !== "number") return null;
+  return {
+    country: p.country ?? null,
+    countryCode: p.country_code ?? null,
+    lat: p.latitude,
+    lng: p.longitude,
+  };
+}
+
+/** Resolve an IP (strips :port) to coarse geolocation. Keyless. */
+export async function fetchGeo(
+  ip: string,
+  opts: { fixture?: unknown } = {},
+): Promise<GeoResult | null> {
+  if (opts.fixture) return parseGeo(opts.fixture);
+  const addr = ip.split(":")[0] ?? ip;
+  const res = await fetch(`https://ipwho.is/${encodeURIComponent(addr)}`, {
+    headers: { "user-agent": "OmniSight/0.1" },
+  });
+  if (!res.ok) return null;
+  return parseGeo(await res.json());
+}

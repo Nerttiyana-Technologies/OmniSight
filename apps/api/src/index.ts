@@ -2,10 +2,14 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import { NewSourceSchema, SourceSchema, type Source } from "@omnisight/shared";
-import { createRepository } from "@omnisight/db";
 import {
-  cisaKevConnector, resolveConnector, resolveIndicatorConnector, seedSources, fetchEpss,
+  NewSourceSchema, SourceSchema, type Source,
+  vulnerabilitiesToCsv, indicatorsToCsv, indicatorsToStix, indicatorsToBlocklist,
+} from "@omnisight/shared";
+import { createRepository, composeDigest } from "@omnisight/db";
+import {
+  cisaKevConnector, resolveConnector, resolveIndicatorConnector, resolveAdvisoryConnector,
+  seedSources, fetchEpss,
 } from "@omnisight/connectors";
 
 // Load the repo-root .env (pnpm runs scripts from the package dir, so resolve up).
@@ -79,6 +83,23 @@ app.get("/health", async () => ({ ok: true, store: usingPostgres ? "postgres" : 
 
 app.get("/api/stats", async () => repo.stats());
 
+app.get("/api/map", async () => repo.mapData());
+
+app.get("/api/digest", async (req, reply) => {
+  const digest = await composeDigest(repo);
+  const format = (req.query as { format?: string }).format;
+  if (format === "md") {
+    return reply.header("content-type", "text/markdown; charset=utf-8").send(digest.markdown);
+  }
+  if (format === "html") {
+    return reply
+      .header("content-type", "text/html; charset=utf-8")
+      .header("content-disposition", 'inline; filename="omnisight-brief.html"')
+      .send(digest.html);
+  }
+  return digest;
+});
+
 app.get("/api/vulnerabilities", async (req) => {
   const q = req.query as Record<string, string | undefined>;
   const page = Math.max(1, Number(q.page ?? 1));
@@ -98,6 +119,52 @@ app.get("/api/vulnerabilities", async (req) => {
     dir: q.dir === "asc" ? "asc" : q.dir === "desc" ? "desc" : undefined,
   });
   return { ...result, page, pageSize };
+});
+
+app.get("/api/vulnerabilities/export", async (req, reply) => {
+  const q = req.query as Record<string, string | undefined>;
+  const terms = q.myStack === "true" ? await repo.listWatchlist() : undefined;
+  const { items } = await repo.page({
+    limit: 10000, offset: 0,
+    minRisk: q.minRisk ? Number(q.minRisk) : undefined,
+    q: q.q || undefined, vendor: q.vendor || undefined, source: q.source || undefined,
+    exploited: q.exploited === "true" ? true : undefined,
+    ransomware: q.ransomware === "true" ? true : undefined,
+    terms,
+    sort: q.sort || undefined,
+    dir: q.dir === "asc" ? "asc" : q.dir === "desc" ? "desc" : undefined,
+  });
+  return reply
+    .header("content-type", "text/csv; charset=utf-8")
+    .header("content-disposition", 'attachment; filename="omnisight-vulnerabilities.csv"')
+    .send(vulnerabilitiesToCsv(items));
+});
+
+app.get("/api/indicators/export", async (req, reply) => {
+  const q = req.query as Record<string, string | undefined>;
+  const format = q.format ?? "csv";
+  const { items } = await repo.pageIndicators({
+    limit: 10000, offset: 0,
+    type: q.type || undefined, malware: q.malware || undefined, q: q.q || undefined,
+    source: q.source || undefined, sort: q.sort || undefined,
+    dir: q.dir === "asc" ? "asc" : q.dir === "desc" ? "desc" : undefined,
+  });
+  if (format === "stix") {
+    return reply
+      .header("content-type", "application/json")
+      .header("content-disposition", 'attachment; filename="omnisight-indicators.stix.json"')
+      .send(indicatorsToStix(items));
+  }
+  if (format === "blocklist") {
+    return reply
+      .header("content-type", "text/plain; charset=utf-8")
+      .header("content-disposition", 'attachment; filename="omnisight-blocklist.txt"')
+      .send(indicatorsToBlocklist(items));
+  }
+  return reply
+    .header("content-type", "text/csv; charset=utf-8")
+    .header("content-disposition", 'attachment; filename="omnisight-indicators.csv"')
+    .send(indicatorsToCsv(items));
 });
 
 app.get("/api/indicators", async (req) => {
@@ -135,6 +202,19 @@ app.delete("/api/watchlist/:term", async (req) => {
   return repo.listWatchlist();
 });
 
+app.get("/api/advisories", async (req) => {
+  const q = req.query as Record<string, string | undefined>;
+  const page = Math.max(1, Number(q.page ?? 1));
+  const pageSize = Math.min(200, Math.max(1, Number(q.pageSize ?? 30)));
+  const result = await repo.pageAdvisories({
+    limit: pageSize,
+    offset: (page - 1) * pageSize,
+    source: q.source || undefined,
+    q: q.q || undefined,
+  });
+  return { ...result, page, pageSize };
+});
+
 app.get("/api/sources", async () => repo.listSources());
 
 /**
@@ -169,6 +249,13 @@ app.post("/api/sources/:id/run", async (req, reply) => {
         },
       });
       const n = await repo.upsertIndicators(iocs);
+      await repo.signalChange(id);
+      return { source: id, ingested: n };
+    }
+    if (source.signalType === "advisory") {
+      const connector = resolveAdvisoryConnector(source);
+      const items = await connector.fetchAdvisories();
+      const n = await repo.upsertAdvisories(items);
       await repo.signalChange(id);
       return { source: id, ingested: n };
     }

@@ -39,6 +39,37 @@ vendor, product, or title match are flagged in the grid, filterable with
 "My Stack only", and counted in a dedicated stat card — turning the global feed
 into "what affects *us*". Matching is server-side, so it scales and paginates.
 
+### News & AI threats
+
+A **News** tab ingests security news and advisories via an RSS connector
+(**The Hacker News**, **Dark Reading**, **SecurityWeek — AI**) plus **MITRE
+ATLAS** (the authoritative adversarial-ML knowledge base, via its STIX 2.1
+bundle). Items render as cards with source, date, and summary, filterable by
+source and search. New RSS feeds can be added at runtime as `kind: "rss"`
+sources — no code required.
+
+### Map
+
+A **Map** tab plots geolocated attack origins on a world projection. IP
+indicators are geolocated (keyless ipwho.is) during the worker's enrichment
+cycle; the map aggregates them by country with a Top Origins panel alongside.
+
+### Overview & daily brief
+
+An **Overview** command-center tab leads the dashboard: a DEFCON-style
+**threat-level** header derived from current signal volume, plus the **Daily
+Brief** — top risks, newly-added KEV, what's hitting your stack, and top
+indicators. The brief renders as Markdown and as an **executive HTML email**
+(`/api/digest?format=html`), and a worker job composes it automatically each
+morning (07:00) — schedule-ready for delivery.
+
+### Export / interop
+
+Both grids export the **current filtered view**. Vulnerabilities export to CSV;
+indicators export to **CSV**, a **STIX 2.1 bundle** (importable into OpenCTI /
+MISP), or a plain **blocklist** (IPs/domains/URLs/hashes) for firewalls and IDS —
+so OmniSight pushes intel into the rest of your stack rather than trapping it.
+
 ### Real-time & enrichment
 
 - **Live updates** — the dashboard subscribes to `GET /api/stream` (Server-Sent

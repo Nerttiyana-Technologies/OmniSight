@@ -1,9 +1,11 @@
 import type { Source } from "@omnisight/shared";
-import type { Connector, IndicatorConnector } from "./types.js";
+import type { Connector, IndicatorConnector, AdvisoryConnector } from "./types.js";
 import { cisaKevConnector } from "./cisa-kev.js";
 import { nvdConnector } from "./nvd.js";
 import { threatfoxConnector } from "./threatfox.js";
 import { otxConnector } from "./otx.js";
+import { makeRssConnector } from "./rss.js";
+import { atlasConnector } from "./atlas.js";
 import { makeGenericJsonConnector } from "./generic-json.js";
 
 export * from "./types.js";
@@ -11,9 +13,12 @@ export { cisaKevConnector, normalizeKev } from "./cisa-kev.js";
 export { nvdConnector, normalizeNvd } from "./nvd.js";
 export { threatfoxConnector, normalizeThreatfox } from "./threatfox.js";
 export { otxConnector, normalizeOtx } from "./otx.js";
+export { makeRssConnector, parseRss } from "./rss.js";
+export { atlasConnector, normalizeAtlas } from "./atlas.js";
 export { makeGenericJsonConnector } from "./generic-json.js";
 export {
-  fetchEpss, parseEpss, fetchNvdCvss, extractCvss, cvssFromMetrics, sleep, type EpssResult,
+  fetchEpss, parseEpss, fetchNvdCvss, extractCvss, cvssFromMetrics, sleep,
+  fetchGeo, parseGeo, type EpssResult, type GeoResult,
 } from "./enrichers.js";
 
 /** Built-in vulnerability connectors, keyed by source slug. */
@@ -32,6 +37,18 @@ export function resolveIndicatorConnector(source: Source): IndicatorConnector {
   const c = builtinIndicatorConnectors[source.id];
   if (!c) throw new Error(`No indicator connector available for source "${source.id}"`);
   return c;
+}
+
+/** Built-in advisory connectors (besides config-driven RSS). */
+export const builtinAdvisoryConnectors: Record<string, AdvisoryConnector> = {
+  [atlasConnector.id]: atlasConnector,
+};
+
+export function resolveAdvisoryConnector(source: Source): AdvisoryConnector {
+  const builtin = builtinAdvisoryConnectors[source.id];
+  if (builtin) return builtin;
+  if (source.kind === "rss") return makeRssConnector(source);
+  throw new Error(`No advisory connector available for source "${source.id}"`);
 }
 
 /**
@@ -89,6 +106,50 @@ export const seedSources: Source[] = [
     schedule: "0 */3 * * *",
     enabled: true,
     requiresAuth: true,
+    config: {},
+  },
+  {
+    id: "mitre-atlas",
+    name: "MITRE ATLAS",
+    kind: "builtin",
+    signalType: "advisory",
+    url: null,
+    schedule: "0 6 * * *",
+    enabled: true,
+    requiresAuth: false,
+    config: {},
+  },
+  {
+    id: "securityweek-ai",
+    name: "SecurityWeek — AI",
+    kind: "rss",
+    signalType: "advisory",
+    url: "https://www.securityweek.com/category/artificial-intelligence/feed/",
+    schedule: "0 */3 * * *",
+    enabled: true,
+    requiresAuth: false,
+    config: {},
+  },
+  {
+    id: "thehackernews",
+    name: "The Hacker News",
+    kind: "rss",
+    signalType: "advisory",
+    url: "https://feeds.feedburner.com/TheHackersNews",
+    schedule: "0 */3 * * *",
+    enabled: true,
+    requiresAuth: false,
+    config: {},
+  },
+  {
+    id: "darkreading",
+    name: "Dark Reading",
+    kind: "rss",
+    signalType: "advisory",
+    url: "https://www.darkreading.com/rss.xml",
+    schedule: "0 */3 * * *",
+    enabled: true,
+    requiresAuth: false,
     config: {},
   },
 ];
