@@ -1,0 +1,9 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+# pnpm 11 gates dependency build scripts. Map of package -> allowed?
+#   esbuild: native binary required by Vite + tsx.
+#   msgpackr-extract: optional native speedup; false = stay pure-JS (no warning).
+allowBuilds:
+  esbuild: true
+  msgpackr-extract: false

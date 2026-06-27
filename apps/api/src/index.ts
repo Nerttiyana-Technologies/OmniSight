@@ -1,0 +1,194 @@
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import Fastify from "fastify";
+import cors from "@fastify/cors";
+import { NewSourceSchema, SourceSchema, type Source } from "@omnisight/shared";
+import { createRepository } from "@omnisight/db";
+import {
+  cisaKevConnector, resolveConnector, resolveIndicatorConnector, seedSources, fetchEpss,
+} from "@omnisight/connectors";
+
+// Load the repo-root .env (pnpm runs scripts from the package dir, so resolve up).
+const envFile = fileURLToPath(new URL("../../../.env", import.meta.url));
+if (existsSync(envFile) && typeof process.loadEnvFile === "function") process.loadEnvFile(envFile);
+
+const repo = createRepository();
+const usingPostgres = Boolean(process.env.DATABASE_URL);
+
+async function bootstrap() {
+  await repo.init();
+
+  // Seed source registry.
+  for (const s of seedSources) await repo.upsertSource(s);
+
+  // Zero-dependency demo: with no Postgres, seed the in-memory store from the
+  // bundled CISA KEV fixture so the dashboard has data on first load.
+  if (!usingPostgres) {
+    const { readFileSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    const { dirname, join } = await import("node:path");
+    const here = dirname(fileURLToPath(import.meta.url));
+    const fixturePath = join(here, "../../../packages/connectors/fixtures/cisa-kev.sample.json");
+    try {
+      const fixture = JSON.parse(readFileSync(fixturePath, "utf8"));
+      const vulns = await cisaKevConnector.fetchVulnerabilities({ fixture });
+      await repo.upsertVulnerabilities(vulns);
+      await repo.signalChange("seed");
+      app.log.info(`seeded ${vulns.length} demo vulnerabilities (in-memory mode)`);
+    } catch (e) {
+      app.log.warn(`could not seed demo data: ${(e as Error).message}`);
+    }
+  }
+}
+
+const app = Fastify({ logger: true });
+await app.register(cors, { origin: true });
+
+// --- Server-Sent Events: push an "update" the instant data changes ---
+const sseClients = new Set<import("node:http").ServerResponse>();
+
+function broadcast(payload: string) {
+  const msg = `data: ${JSON.stringify({ changed: true, source: payload, at: Date.now() })}\n\n`;
+  for (const res of sseClients) {
+    try {
+      res.write(msg);
+    } catch {
+      sseClients.delete(res);
+    }
+  }
+}
+
+app.get("/api/stream", (req, reply) => {
+  reply.hijack();
+  const res = reply.raw;
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  });
+  res.write("retry: 5000\n\n");
+  sseClients.add(res);
+  const keepAlive = setInterval(() => res.write(": ping\n\n"), 25000);
+  req.raw.on("close", () => {
+    clearInterval(keepAlive);
+    sseClients.delete(res);
+  });
+});
+
+app.get("/health", async () => ({ ok: true, store: usingPostgres ? "postgres" : "memory" }));
+
+app.get("/api/stats", async () => repo.stats());
+
+app.get("/api/vulnerabilities", async (req) => {
+  const q = req.query as Record<string, string | undefined>;
+  const page = Math.max(1, Number(q.page ?? 1));
+  const pageSize = Math.min(200, Math.max(1, Number(q.pageSize ?? 50)));
+  const result = await repo.page({
+    limit: pageSize,
+    offset: (page - 1) * pageSize,
+    minRisk: q.minRisk ? Number(q.minRisk) : undefined,
+    q: q.q || undefined,
+    vendor: q.vendor || undefined,
+    source: q.source || undefined,
+    exploited: q.exploited === "true" ? true : undefined,
+    ransomware: q.ransomware === "true" ? true : undefined,
+    sort: q.sort || undefined,
+    dir: q.dir === "asc" ? "asc" : q.dir === "desc" ? "desc" : undefined,
+  });
+  return { ...result, page, pageSize };
+});
+
+app.get("/api/indicators", async (req) => {
+  const q = req.query as Record<string, string | undefined>;
+  const page = Math.max(1, Number(q.page ?? 1));
+  const pageSize = Math.min(200, Math.max(1, Number(q.pageSize ?? 50)));
+  const result = await repo.pageIndicators({
+    limit: pageSize,
+    offset: (page - 1) * pageSize,
+    type: q.type || undefined,
+    malware: q.malware || undefined,
+    q: q.q || undefined,
+    source: q.source || undefined,
+    sort: q.sort || undefined,
+    dir: q.dir === "asc" ? "asc" : q.dir === "desc" ? "desc" : undefined,
+  });
+  return { ...result, page, pageSize };
+});
+
+app.get("/api/sources", async () => repo.listSources());
+
+/**
+ * Admin: register a new feed at runtime — no code, no redeploy.
+ * Built-in connectors handle high-value feeds; `kind: "json"` sources are
+ * driven entirely by this config via the generic connector.
+ */
+app.post("/api/sources", async (req, reply) => {
+  const parsed = NewSourceSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return reply.status(400).send({ error: parsed.error.flatten() });
+  }
+  const data = parsed.data;
+  const id = data.id ?? slugify(data.name);
+  const source: Source = SourceSchema.parse({ ...data, id });
+  await repo.upsertSource(source);
+  return reply.status(201).send(source);
+});
+
+/** Admin: trigger an immediate fetch for a source (otherwise it runs on schedule). */
+app.post("/api/sources/:id/run", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const source = (await repo.listSources()).find((s) => s.id === id);
+  if (!source) return reply.status(404).send({ error: "source not found" });
+  try {
+    if (source.signalType === "indicator") {
+      const connector = resolveIndicatorConnector(source);
+      const iocs = await connector.fetchIndicators({
+        credentials: { authKey: process.env.ABUSECH_AUTH_KEY?.trim() || undefined },
+      });
+      const n = await repo.upsertIndicators(iocs);
+      await repo.signalChange(id);
+      return { source: id, ingested: n };
+    }
+    const connector = resolveConnector(source);
+    const vulns = await connector.fetchVulnerabilities({
+      credentials: {
+        authKey: process.env.ABUSECH_AUTH_KEY?.trim() || undefined,
+        nvdApiKey: process.env.NVD_API_KEY?.trim() || undefined,
+      },
+    });
+    const n = await repo.upsertVulnerabilities(vulns);
+    await repo.signalChange(id);
+    return { source: id, ingested: n };
+  } catch (e) {
+    return reply.status(502).send({ error: (e as Error).message });
+  }
+});
+
+/**
+ * Enrich tracked CVEs with EPSS scores (keyless, bulk, fast). Lets the no-worker
+ * demo pull live exploit-probability scores on demand. NVD/CVSS enrichment runs
+ * in the worker because it's rate-limited.
+ */
+app.post("/api/enrich", async (_req, reply) => {
+  try {
+    const ids = await repo.distinctCveIds("epss", 500);
+    if (ids.length === 0) return { enriched: 0 };
+    const scores = await fetchEpss(ids);
+    const n = await repo.enrich(scores.map((s) => ({ cveId: s.cveId, epss: s.epss })));
+    await repo.signalChange("epss");
+    return { enriched: n };
+  } catch (e) {
+    return reply.status(502).send({ error: (e as Error).message });
+  }
+});
+
+function slugify(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+const port = Number(process.env.API_PORT ?? 4000);
+await bootstrap();
+// Fan every change signal (from this API, or a worker NOTIFY in Postgres mode)
+// out to all connected SSE clients.
+await repo.subscribeChanges((payload) => broadcast(payload));
+await app.listen({ port, host: "0.0.0.0" });

@@ -1,0 +1,23 @@
+{
+  "name": "@omnisight/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@omnisight/connectors": "workspace:*",
+    "@omnisight/db": "workspace:*",
+    "@omnisight/shared": "workspace:*",
+    "bullmq": "^5.34.0",
+    "ioredis": "^5.4.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}

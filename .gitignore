@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.turbo/
+*.log
+.env
+.env.local
+.DS_Store
+coverage/
+
+# Private: planning docs and architecture decision records stay local
+docs/
+**/adr/
+**/ADR/
+*.adr.md
