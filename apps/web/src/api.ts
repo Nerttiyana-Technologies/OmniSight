@@ -1,4 +1,4 @@
-import type { Vulnerability, Indicator, Source, NewSource } from "@omnisight/shared";
+import type { Vulnerability, Indicator, Advisory, Source, NewSource, Digest } from "@omnisight/shared";
 
 export interface Stats {
   total: number;
@@ -28,6 +28,20 @@ export interface IndicatorPage {
   pageSize: number;
 }
 
+export interface AdvisoryQuery {
+  page?: number;
+  pageSize?: number;
+  source?: string;
+  q?: string;
+}
+
+export interface AdvisoryPage {
+  items: Advisory[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
 export interface VulnQuery {
   page?: number;
   pageSize?: number;
@@ -49,28 +63,56 @@ export interface VulnPage {
   pageSize: number;
 }
 
+export interface MapPoint {
+  country: string;
+  code: string | null;
+  lat: number;
+  lng: number;
+  count: number;
+}
+
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json() as Promise<T>;
 }
 
+function vulnQs(params: VulnQuery): string {
+  const qs = new URLSearchParams();
+  if (params.page != null) qs.set("page", String(params.page));
+  if (params.pageSize != null) qs.set("pageSize", String(params.pageSize));
+  if (params.minRisk) qs.set("minRisk", String(params.minRisk));
+  if (params.q) qs.set("q", params.q);
+  if (params.vendor) qs.set("vendor", params.vendor);
+  if (params.source) qs.set("source", params.source);
+  if (params.exploited) qs.set("exploited", "true");
+  if (params.ransomware) qs.set("ransomware", "true");
+  if (params.myStack) qs.set("myStack", "true");
+  if (params.sort) qs.set("sort", params.sort);
+  if (params.dir) qs.set("dir", params.dir);
+  return qs.toString();
+}
+
+function iocQs(params: IndicatorQuery): string {
+  const qs = new URLSearchParams();
+  if (params.page != null) qs.set("page", String(params.page));
+  if (params.pageSize != null) qs.set("pageSize", String(params.pageSize));
+  if (params.type) qs.set("type", params.type);
+  if (params.malware) qs.set("malware", params.malware);
+  if (params.q) qs.set("q", params.q);
+  if (params.source) qs.set("source", params.source);
+  if (params.sort) qs.set("sort", params.sort);
+  if (params.dir) qs.set("dir", params.dir);
+  return qs.toString();
+}
+
 export const api = {
   stats: () => fetch("/api/stats").then(json<Stats>),
-  vulnerabilities: (params: VulnQuery = {}) => {
-    const qs = new URLSearchParams();
-    if (params.page != null) qs.set("page", String(params.page));
-    if (params.pageSize != null) qs.set("pageSize", String(params.pageSize));
-    if (params.minRisk) qs.set("minRisk", String(params.minRisk));
-    if (params.q) qs.set("q", params.q);
-    if (params.vendor) qs.set("vendor", params.vendor);
-    if (params.source) qs.set("source", params.source);
-    if (params.exploited) qs.set("exploited", "true");
-    if (params.ransomware) qs.set("ransomware", "true");
-    if (params.myStack) qs.set("myStack", "true");
-    if (params.sort) qs.set("sort", params.sort);
-    if (params.dir) qs.set("dir", params.dir);
-    return fetch(`/api/vulnerabilities?${qs}`).then(json<VulnPage>);
-  },
+  map: () => fetch("/api/map").then(json<MapPoint[]>),
+  digest: () => fetch("/api/digest").then(json<Digest>),
+  digestUrl: (format: "html" | "md") => `/api/digest?format=${format}`,
+  vulnerabilities: (params: VulnQuery = {}) =>
+    fetch(`/api/vulnerabilities?${vulnQs(params)}`).then(json<VulnPage>),
+  exportVulnUrl: (params: VulnQuery = {}) => `/api/vulnerabilities/export?${vulnQs(params)}`,
   sources: () => fetch("/api/sources").then(json<Source[]>),
   addSource: (body: NewSource) =>
     fetch("/api/sources", {
@@ -80,17 +122,19 @@ export const api = {
     }).then(json<Source>),
   runSource: (id: string) =>
     fetch(`/api/sources/${id}/run`, { method: "POST" }).then(json<{ ingested: number }>),
-  indicators: (params: IndicatorQuery = {}) => {
+  indicators: (params: IndicatorQuery = {}) =>
+    fetch(`/api/indicators?${iocQs(params)}`).then(json<IndicatorPage>),
+  exportIndicatorUrl: (params: IndicatorQuery = {}, format = "csv") => {
+    const qs = iocQs(params);
+    return `/api/indicators/export?${qs}${qs ? "&" : ""}format=${format}`;
+  },
+  advisories: (params: AdvisoryQuery = {}) => {
     const qs = new URLSearchParams();
     if (params.page != null) qs.set("page", String(params.page));
     if (params.pageSize != null) qs.set("pageSize", String(params.pageSize));
-    if (params.type) qs.set("type", params.type);
-    if (params.malware) qs.set("malware", params.malware);
-    if (params.q) qs.set("q", params.q);
     if (params.source) qs.set("source", params.source);
-    if (params.sort) qs.set("sort", params.sort);
-    if (params.dir) qs.set("dir", params.dir);
-    return fetch(`/api/indicators?${qs}`).then(json<IndicatorPage>);
+    if (params.q) qs.set("q", params.q);
+    return fetch(`/api/advisories?${qs}`).then(json<AdvisoryPage>);
   },
   watchlist: () => fetch("/api/watchlist").then(json<string[]>),
   addWatch: (term: string) =>

@@ -59,6 +59,10 @@ CREATE TABLE IF NOT EXISTS indicators (
   tags            JSONB NOT NULL DEFAULT '[]',
   first_seen      TIMESTAMPTZ,
   last_seen       TIMESTAMPTZ,
+  country         TEXT,
+  country_code    TEXT,
+  lat             DOUBLE PRECISION,
+  lng             DOUBLE PRECISION,
   fetched_at      TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (source, id)
 );
@@ -67,6 +71,23 @@ CREATE INDEX IF NOT EXISTS idx_ioc_lastseen   ON indicators (last_seen DESC);
 CREATE INDEX IF NOT EXISTS idx_ioc_type       ON indicators (type);
 CREATE INDEX IF NOT EXISTS idx_ioc_malware    ON indicators (malware);
 CREATE INDEX IF NOT EXISTS idx_ioc_value      ON indicators (value);
+CREATE INDEX IF NOT EXISTS idx_ioc_country    ON indicators (country_code);
+
+CREATE TABLE IF NOT EXISTS advisories (
+  id          TEXT NOT NULL,
+  source      TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  title       TEXT NOT NULL,
+  summary     TEXT NOT NULL DEFAULT '',
+  url         TEXT NOT NULL DEFAULT '',
+  category    TEXT,
+  published   TIMESTAMPTZ,
+  tags        JSONB NOT NULL DEFAULT '[]',
+  fetched_at  TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (source, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_adv_published ON advisories (published DESC);
+CREATE INDEX IF NOT EXISTS idx_adv_source    ON advisories (source);
 
 -- "My Stack": software/vendors the user runs. A vuln is "in stack" when its
 -- vendor, product, or title matches one of these terms.

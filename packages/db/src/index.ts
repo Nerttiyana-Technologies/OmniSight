@@ -3,7 +3,10 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { EventEmitter } from "node:events";
 import pg from "pg";
-import { computeRiskScore, type Source, type Vulnerability, type Indicator } from "@omnisight/shared";
+import {
+  computeRiskScore, buildDigest,
+  type Source, type Vulnerability, type Indicator, type Advisory, type Digest,
+} from "@omnisight/shared";
 
 export interface ListOptions {
   limit?: number;
@@ -32,6 +35,7 @@ export interface Stats {
   high: number;
   sources: number;
   indicators: number;
+  advisories: number;
   inStack: number;
 }
 
@@ -51,6 +55,33 @@ export interface IndicatorPage {
   total: number;
 }
 
+export interface GeoPatch {
+  country: string | null;
+  countryCode: string | null;
+  lat: number | null;
+  lng: number | null;
+}
+
+export interface MapPoint {
+  country: string;
+  code: string | null;
+  lat: number;
+  lng: number;
+  count: number;
+}
+
+export interface AdvisoryListOptions {
+  limit?: number;
+  offset?: number;
+  source?: string;
+  q?: string;
+}
+
+export interface AdvisoryPage {
+  items: Advisory[];
+  total: number;
+}
+
 /** Patch applied to every row matching a CVE id (used by enrichers). */
 export interface EnrichPatch {
   cveId: string;
@@ -67,9 +98,17 @@ export interface Repository {
   page(opts?: ListOptions): Promise<Page>;
   upsertIndicators(items: Indicator[]): Promise<number>;
   pageIndicators(opts?: IndicatorListOptions): Promise<IndicatorPage>;
+  upsertAdvisories(items: Advisory[]): Promise<number>;
+  pageAdvisories(opts?: AdvisoryListOptions): Promise<AdvisoryPage>;
   listWatchlist(): Promise<string[]>;
   addWatchTerm(term: string): Promise<void>;
   removeWatchTerm(term: string): Promise<void>;
+  /** Distinct IP-indicator values still missing geolocation. */
+  ipsNeedingGeo(limit?: number): Promise<string[]>;
+  /** Apply geolocation to all indicator rows sharing a value. */
+  setGeo(value: string, geo: GeoPatch): Promise<void>;
+  /** Indicator counts aggregated by country for the map. */
+  mapData(): Promise<MapPoint[]>;
   upsertSource(source: Source): Promise<void>;
   listSources(): Promise<Source[]>;
   stats(): Promise<Stats>;
@@ -92,6 +131,20 @@ export function createRepository(databaseUrl = process.env.DATABASE_URL): Reposi
 
 // ---------------------------------------------------------------------------
 
+/** Gather the day's signals from any repository and build the brief. */
+export async function composeDigest(repo: Repository): Promise<Digest> {
+  const [stats, terms] = await Promise.all([repo.stats(), repo.listWatchlist()]);
+  const [topVulns, recentKev, topIocs] = await Promise.all([
+    repo.page({ sort: "risk", dir: "desc", limit: 10 }).then((r) => r.items),
+    repo.page({ source: "cisa-kev", sort: "reported", dir: "desc", limit: 10 }).then((r) => r.items),
+    repo.pageIndicators({ sort: "confidence", dir: "desc", limit: 10 }).then((r) => r.items),
+  ]);
+  const stackVulns = terms.length
+    ? (await repo.page({ terms, sort: "risk", dir: "desc", limit: 10 })).items
+    : [];
+  return buildDigest({ stats, terms, topVulns, recentKev, stackVulns, topIocs });
+}
+
 /** True if a vulnerability matches any "My Stack" term (vendor/product/title). */
 export function matchesTerms(v: Vulnerability, terms: string[]): boolean {
   if (terms.length === 0) return false;
@@ -102,11 +155,30 @@ export function matchesTerms(v: Vulnerability, terms: string[]): boolean {
 export class InMemoryRepository implements Repository {
   private vulns = new Map<string, Vulnerability>();
   private indicators = new Map<string, Indicator>();
+  private advisories = new Map<string, Advisory>();
   private sources = new Map<string, Source>();
   private watch = new Set<string>();
   private bus = new EventEmitter();
 
   async init(): Promise<void> {}
+
+  async upsertAdvisories(items: Advisory[]): Promise<number> {
+    for (const a of items) this.advisories.set(`${a.source}:${a.id}`, a);
+    return items.length;
+  }
+
+  async pageAdvisories(opts: AdvisoryListOptions = {}): Promise<AdvisoryPage> {
+    let rows = [...this.advisories.values()];
+    if (opts.source) rows = rows.filter((a) => a.source === opts.source);
+    if (opts.q) {
+      const q = opts.q.toLowerCase();
+      rows = rows.filter((a) => a.title.toLowerCase().includes(q) || a.summary.toLowerCase().includes(q));
+    }
+    rows.sort((a, b) => (b.published ?? "").localeCompare(a.published ?? ""));
+    const offset = opts.offset ?? 0;
+    const limit = opts.limit ?? 50;
+    return { items: rows.slice(offset, offset + limit), total: rows.length };
+  }
 
   async listWatchlist(): Promise<string[]> {
     return [...this.watch];
@@ -122,6 +194,40 @@ export class InMemoryRepository implements Repository {
   async upsertIndicators(items: Indicator[]): Promise<number> {
     for (const i of items) this.indicators.set(`${i.source}:${i.id}`, i);
     return items.length;
+  }
+
+  async ipsNeedingGeo(limit = 200): Promise<string[]> {
+    const ips = new Set<string>();
+    for (const i of this.indicators.values()) {
+      if (i.type === "ip" && i.lat == null) {
+        ips.add(i.value);
+        if (ips.size >= limit) break;
+      }
+    }
+    return [...ips];
+  }
+
+  async setGeo(value: string, geo: GeoPatch): Promise<void> {
+    for (const i of this.indicators.values()) {
+      if (i.value === value) {
+        i.country = geo.country;
+        i.countryCode = geo.countryCode;
+        i.lat = geo.lat;
+        i.lng = geo.lng;
+      }
+    }
+  }
+
+  async mapData(): Promise<MapPoint[]> {
+    const byCountry = new Map<string, { country: string; code: string | null; lat: number; lng: number; count: number }>();
+    for (const i of this.indicators.values()) {
+      if (i.lat == null || i.lng == null) continue;
+      const key = i.countryCode ?? i.country ?? `${i.lat},${i.lng}`;
+      const cur = byCountry.get(key);
+      if (cur) cur.count++;
+      else byCountry.set(key, { country: i.country ?? "Unknown", code: i.countryCode, lat: i.lat, lng: i.lng, count: 1 });
+    }
+    return [...byCountry.values()].sort((a, b) => b.count - a.count);
   }
 
   async pageIndicators(opts: IndicatorListOptions = {}): Promise<IndicatorPage> {
@@ -288,6 +394,7 @@ export class InMemoryRepository implements Repository {
       high: rows.filter((v) => v.riskScore >= 50 && v.riskScore < 75).length,
       sources: this.sources.size,
       indicators: this.indicators.size,
+      advisories: this.advisories.size,
       inStack: terms.length ? rows.filter((v) => matchesTerms(v, terms)).length : 0,
     };
   }
@@ -526,16 +633,23 @@ export class PostgresRepository implements Repository {
       for (const i of items) {
         await client.query(
           `INSERT INTO indicators
-             (id,source,type,value,malware,threat_type,confidence,references_json,tags,first_seen,last_seen,fetched_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+             (id,source,type,value,malware,threat_type,confidence,references_json,tags,first_seen,last_seen,country,country_code,lat,lng,fetched_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
            ON CONFLICT (source,id) DO UPDATE SET
              type=EXCLUDED.type, value=EXCLUDED.value, malware=EXCLUDED.malware,
              threat_type=EXCLUDED.threat_type, confidence=EXCLUDED.confidence,
              references_json=EXCLUDED.references_json, tags=EXCLUDED.tags,
-             first_seen=EXCLUDED.first_seen, last_seen=EXCLUDED.last_seen, fetched_at=EXCLUDED.fetched_at`,
+             first_seen=EXCLUDED.first_seen, last_seen=EXCLUDED.last_seen,
+             -- keep existing geo if the new row hasn't been geolocated yet
+             country=COALESCE(EXCLUDED.country, indicators.country),
+             country_code=COALESCE(EXCLUDED.country_code, indicators.country_code),
+             lat=COALESCE(EXCLUDED.lat, indicators.lat),
+             lng=COALESCE(EXCLUDED.lng, indicators.lng),
+             fetched_at=EXCLUDED.fetched_at`,
           [
             i.id, i.source, i.type, i.value, i.malware, i.threatType, i.confidence,
-            JSON.stringify(i.references), JSON.stringify(i.tags), i.firstSeen, i.lastSeen, i.fetchedAt,
+            JSON.stringify(i.references), JSON.stringify(i.tags), i.firstSeen, i.lastSeen,
+            i.country ?? null, i.countryCode ?? null, i.lat ?? null, i.lng ?? null, i.fetchedAt,
           ],
         );
       }
@@ -580,6 +694,79 @@ export class PostgresRepository implements Repository {
     return { items: rows.map(rowToIndicator), total };
   }
 
+  async upsertAdvisories(items: Advisory[]): Promise<number> {
+    if (items.length === 0) return 0;
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (const a of items) {
+        await client.query(
+          `INSERT INTO advisories (id,source,title,summary,url,category,published,tags,fetched_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+           ON CONFLICT (source,id) DO UPDATE SET
+             title=EXCLUDED.title, summary=EXCLUDED.summary, url=EXCLUDED.url,
+             category=EXCLUDED.category, published=EXCLUDED.published, tags=EXCLUDED.tags,
+             fetched_at=EXCLUDED.fetched_at`,
+          [a.id, a.source, a.title, a.summary, a.url, a.category, a.published, JSON.stringify(a.tags), a.fetchedAt],
+        );
+      }
+      await client.query("COMMIT");
+      return items.length;
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async pageAdvisories(opts: AdvisoryListOptions = {}): Promise<AdvisoryPage> {
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (opts.source) { params.push(opts.source); where.push(`source = $${params.length}`); }
+    if (opts.q) {
+      params.push(`%${opts.q}%`);
+      where.push(`(title ILIKE $${params.length} OR summary ILIKE $${params.length})`);
+    }
+    const clause = where.length ? "WHERE " + where.join(" AND ") : "";
+    const countRes = await this.pool.query(`SELECT COUNT(*)::int AS total FROM advisories ${clause}`, params);
+    const total = countRes.rows[0].total as number;
+    const paged = [...params];
+    paged.push(opts.limit ?? 50);
+    const li = `$${paged.length}`;
+    paged.push(opts.offset ?? 0);
+    const oi = `$${paged.length}`;
+    const sql = `SELECT * FROM advisories ${clause} ORDER BY published DESC NULLS LAST, id LIMIT ${li} OFFSET ${oi}`;
+    const { rows } = await this.pool.query(sql, paged);
+    return { items: rows.map(rowToAdvisory), total };
+  }
+
+  async ipsNeedingGeo(limit = 200): Promise<string[]> {
+    const { rows } = await this.pool.query(
+      `SELECT DISTINCT value FROM indicators WHERE type = 'ip' AND lat IS NULL LIMIT $1`,
+      [limit],
+    );
+    return rows.map((r) => r.value as string);
+  }
+
+  async setGeo(value: string, geo: GeoPatch): Promise<void> {
+    await this.pool.query(
+      `UPDATE indicators SET country=$2, country_code=$3, lat=$4, lng=$5 WHERE value=$1`,
+      [value, geo.country, geo.countryCode, geo.lat, geo.lng],
+    );
+  }
+
+  async mapData(): Promise<MapPoint[]> {
+    const { rows } = await this.pool.query(
+      `SELECT COALESCE(country,'Unknown') AS country, country_code AS code,
+              AVG(lat)::float8 AS lat, AVG(lng)::float8 AS lng, COUNT(*)::int AS count
+         FROM indicators WHERE lat IS NOT NULL AND lng IS NOT NULL
+         GROUP BY country, country_code
+         ORDER BY count DESC`,
+    );
+    return rows.map((r) => ({ country: r.country, code: r.code, lat: r.lat, lng: r.lng, count: r.count }));
+  }
+
   async stats(): Promise<Stats> {
     const { rows } = await this.pool.query(
       `SELECT COUNT(*)::int AS total,
@@ -588,7 +775,8 @@ export class PostgresRepository implements Repository {
               COUNT(*) FILTER (WHERE risk_score >= 75)::int AS critical,
               COUNT(*) FILTER (WHERE risk_score >= 50 AND risk_score < 75)::int AS high,
               (SELECT COUNT(*)::int FROM sources) AS sources,
-              (SELECT COUNT(*)::int FROM indicators) AS indicators
+              (SELECT COUNT(*)::int FROM indicators) AS indicators,
+              (SELECT COUNT(*)::int FROM advisories) AS advisories
        FROM vulnerabilities`,
     );
     const r = rows[0];
@@ -618,6 +806,7 @@ export class PostgresRepository implements Repository {
       high: r.high,
       sources: r.sources,
       indicators: r.indicators,
+      advisories: r.advisories,
       inStack,
     };
   }
@@ -646,6 +835,20 @@ function rowToVuln(r: Record<string, unknown>): Vulnerability {
   };
 }
 
+function rowToAdvisory(r: Record<string, unknown>): Advisory {
+  return {
+    id: r.id as string,
+    source: r.source as string,
+    title: r.title as string,
+    summary: (r.summary as string) ?? "",
+    url: (r.url as string) ?? "",
+    category: (r.category as string) ?? null,
+    published: r.published ? new Date(r.published as string).toISOString() : null,
+    tags: (r.tags as string[]) ?? [],
+    fetchedAt: new Date(r.fetched_at as string).toISOString(),
+  };
+}
+
 function rowToIndicator(r: Record<string, unknown>): Indicator {
   return {
     id: r.id as string,
@@ -659,6 +862,10 @@ function rowToIndicator(r: Record<string, unknown>): Indicator {
     tags: (r.tags as string[]) ?? [],
     firstSeen: r.first_seen ? new Date(r.first_seen as string).toISOString() : null,
     lastSeen: r.last_seen ? new Date(r.last_seen as string).toISOString() : null,
+    country: (r.country as string) ?? null,
+    countryCode: (r.country_code as string) ?? null,
+    lat: r.lat != null ? Number(r.lat) : null,
+    lng: r.lng != null ? Number(r.lng) : null,
     fetchedAt: new Date(r.fetched_at as string).toISOString(),
   };
 }

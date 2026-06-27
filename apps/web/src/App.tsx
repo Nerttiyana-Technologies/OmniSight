@@ -1,17 +1,23 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   Radar, Moon, Sun, RefreshCw, Plus, ShieldAlert, Skull, Flame, Database, TrendingUp, Rss,
-  Activity, Gauge, ChevronLeft, ChevronRight, Crosshair, Server, X,
+  Activity, Gauge, ChevronLeft, ChevronRight, Crosshair, Server, X, Download, FileText, Newspaper, ExternalLink,
 } from "lucide-react";
 import {
-  riskBand, type Vulnerability, type Indicator, type NewSource, type Source,
+  riskBand, threatLevel, type Vulnerability, type Indicator, type Advisory, type NewSource, type Source,
+  type Digest, type DigestTone,
 } from "@omnisight/shared";
 import {
-  api, type Stats, type VulnQuery, type IndicatorQuery,
+  api, type Stats, type VulnQuery, type IndicatorQuery, type AdvisoryQuery, type MapPoint,
 } from "./api.ts";
+import { makeProjector, topologyToGeometries, geomToPath, type Geom } from "./geo.ts";
 
 type Theme = "dark" | "light";
-type Tab = "vulns" | "iocs";
+type Tab = "overview" | "vulns" | "iocs" | "news" | "map";
+
+function toneBadgeClass(tone?: DigestTone): string {
+  return tone && tone !== "info" ? tone : "info";
+}
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
@@ -21,6 +27,16 @@ function formatDate(s: string | null): string {
   const d = new Date(s.length <= 10 ? `${s}T00:00:00` : s);
   if (Number.isNaN(d.getTime())) return s;
   return `${MONTHS[d.getMonth()]}/${String(d.getDate()).padStart(2, "0")}/${d.getFullYear()}`;
+}
+
+/** Trigger a browser download for an export URL (server sets attachment headers). */
+function download(url: string) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 /** Client-side "in my stack" check (mirrors the server's matching). */
@@ -33,7 +49,7 @@ function inStack(v: Vulnerability, terms: string[]): boolean {
 export function App() {
   const [theme, setTheme] = useState<Theme>("dark");
   const [stats, setStats] = useState<Stats | null>(null);
-  const [tab, setTab] = useState<Tab>("vulns");
+  const [tab, setTab] = useState<Tab>("overview");
   const [sources, setSources] = useState<Source[]>([]);
   const [terms, setTerms] = useState<string[]>([]);
   const [showAdd, setShowAdd] = useState(false);
@@ -147,6 +163,7 @@ export function App() {
           <StatCard icon={<Flame size={16} />} label="Critical (75+)" value={stats?.critical} crit />
           <StatCard icon={<TrendingUp size={16} />} label="High (50–74)" value={stats?.high} />
           <StatCard icon={<Crosshair size={16} />} label="Indicators" value={stats?.indicators} />
+          <StatCard icon={<Newspaper size={16} />} label="News" value={stats?.advisories} />
           <StatCard icon={<Server size={16} />} label="My Stack" value={stats?.inStack} accent />
           <StatCard icon={<Rss size={16} />} label="Active Sources" value={stats?.sources} />
         </section>
@@ -155,18 +172,253 @@ export function App() {
         {showAdd && <AddFeed onAdded={bump} />}
 
         <div className="tabs">
+          <button className={`tab ${tab === "overview" ? "active" : ""}`} onClick={() => setTab("overview")}>
+            Overview
+          </button>
           <button className={`tab ${tab === "vulns" ? "active" : ""}`} onClick={() => setTab("vulns")}>
             Vulnerabilities {stats && <span className="muted">({stats.total.toLocaleString()})</span>}
           </button>
           <button className={`tab ${tab === "iocs" ? "active" : ""}`} onClick={() => setTab("iocs")}>
             Indicators {stats && <span className="muted">({stats.indicators.toLocaleString()})</span>}
           </button>
+          <button className={`tab ${tab === "news" ? "active" : ""}`} onClick={() => setTab("news")}>
+            News {stats && <span className="muted">({stats.advisories.toLocaleString()})</span>}
+          </button>
+          <button className={`tab ${tab === "map" ? "active" : ""}`} onClick={() => setTab("map")}>
+            Map
+          </button>
         </div>
 
-        {tab === "vulns"
-          ? <VulnGrid reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "vulnerability")} terms={terms} />
-          : <IndicatorGrid reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "indicator")} />}
+        {tab === "overview" && <Overview reloadKey={reloadKey} stats={stats} />}
+        {tab === "vulns" && <VulnGrid reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "vulnerability")} terms={terms} />}
+        {tab === "iocs" && <IndicatorGrid reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "indicator")} />}
+        {tab === "news" && <NewsView reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "advisory")} />}
+        {tab === "map" && <MapView reloadKey={reloadKey} />}
       </main>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// News / advisories
+
+function NewsView({ reloadKey, sources }: { reloadKey: number; sources: Source[] }) {
+  const [items, setItems] = useState<Advisory[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [pageSize] = useState(30);
+  const [filters, setFilters] = useState<{ q: string; source: string }>({ q: "", source: "" });
+  const [loading, setLoading] = useState(false);
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+
+  const ref = useRef({ page, filters });
+  ref.current = { page, filters };
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const { page, filters } = ref.current;
+      const q: AdvisoryQuery = { page, pageSize: 30 };
+      if (filters.q) q.q = filters.q;
+      if (filters.source) q.source = filters.source;
+      const p = await api.advisories(q);
+      setItems(p.items); setTotal(p.total);
+    } catch { /* offline */ } finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => {
+    const t = setTimeout(load, 250);
+    return () => clearTimeout(t);
+  }, [reloadKey, page, filters, load]);
+
+  function setFilter<K extends "q" | "source">(k: K, v: string) {
+    setFilters((f) => ({ ...f, [k]: v }));
+    setPage(1);
+  }
+
+  return (
+    <div>
+      <div className="news-toolbar">
+        <input className="news-search" placeholder="Search news & advisories…" value={filters.q} onChange={(e) => setFilter("q", e.target.value)} />
+        <select className="page-size" value={filters.source} onChange={(e) => setFilter("source", e.target.value)} aria-label="Source">
+          <option value="">All sources</option>
+          {sources.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+        </select>
+      </div>
+      {items.length === 0 && (
+        <div className="panel" style={{ padding: 28, textAlign: "center" }}>
+          <span className="muted">{total === 0 ? "No news yet — ensure the worker is running to pull feeds." : "No matches."}</span>
+        </div>
+      )}
+      <div className="news-list">
+        {items.map((a) => (
+          <a className="panel news-card" key={`${a.source}:${a.id}`} href={a.url || "#"} target="_blank" rel="noopener noreferrer">
+            <div className="news-meta">
+              <span className="news-source">{a.source}</span>
+              {a.category && <span className="news-cat">{a.category}</span>}
+              <span className="muted">{formatDate(a.published)}</span>
+              <ExternalLink size={13} className="news-ext" />
+            </div>
+            <div className="news-title">{a.title}</div>
+            {a.summary && <div className="news-summary muted">{a.summary}</div>}
+          </a>
+        ))}
+      </div>
+      <div className="pager" style={{ borderTop: "none" }}>
+        <span className="muted">{total.toLocaleString()} item{total === 1 ? "" : "s"}{loading ? " · loading…" : ""}</span>
+        <div className="pager-controls">
+          <button className="icon-btn" data-tooltip="Previous page" disabled={page <= 1} onClick={() => setPage((p) => Math.max(1, p - 1))}><ChevronLeft size={16} /></button>
+          <span className="muted">Page {page} of {pages}</span>
+          <button className="icon-btn" data-tooltip="Next page" disabled={page >= pages} onClick={() => setPage((p) => Math.min(pages, p + 1))}><ChevronRight size={16} /></button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// World map (geolocated attack origins)
+
+const WORLD_URL = "https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json";
+let worldCache: Geom[] | null = null;
+async function loadWorld(): Promise<Geom[]> {
+  if (worldCache) return worldCache;
+  const res = await fetch(WORLD_URL);
+  const topo = await res.json();
+  worldCache = topologyToGeometries(topo, "countries");
+  return worldCache;
+}
+
+function MapView({ reloadKey }: { reloadKey: number }) {
+  const [points, setPoints] = useState<MapPoint[]>([]);
+  const [land, setLand] = useState<Geom[]>([]);
+
+  useEffect(() => {
+    api.map().then(setPoints).catch(() => {});
+  }, [reloadKey]);
+
+  useEffect(() => {
+    loadWorld().then(setLand).catch(() => {}); // graceful: graticule-only if CDN blocked
+  }, []);
+
+  const W = 1000;
+  const H = 500;
+  const proj = makeProjector(W, H);
+  const max = points.reduce((m, p) => Math.max(m, p.count), 1);
+  const radius = (c: number) => 4 + Math.sqrt(c / max) * 22;
+
+  const graticule: React.ReactNode[] = [];
+  for (let lng = -150; lng <= 150; lng += 30) {
+    const [x] = proj(lng, 0);
+    graticule.push(<line key={`v${lng}`} x1={x} y1={0} x2={x} y2={H} />);
+  }
+  for (let lat = -60; lat <= 60; lat += 30) {
+    const [, y] = proj(0, lat);
+    graticule.push(<line key={`h${lat}`} x1={0} y1={y} x2={W} y2={y} />);
+  }
+
+  return (
+    <div className="map-layout">
+      <div className="panel map-wrap">
+        <svg viewBox={`0 0 ${W} ${H}`} className="worldmap" preserveAspectRatio="xMidYMid meet">
+          <rect x={0} y={0} width={W} height={H} className="map-bg" />
+          <g className="graticule">{graticule}</g>
+          <g className="map-land-group">
+            {land.map((g, i) => <path key={i} className="map-land" d={geomToPath(g, proj)} />)}
+          </g>
+          {points.map((p, i) => {
+            const [x, y] = proj(p.lng, p.lat);
+            return (
+              <g key={i}>
+                <circle cx={x} cy={y} r={radius(p.count)} className="map-glow" />
+                <circle cx={x} cy={y} r={Math.max(2.5, radius(p.count) * 0.34)} className="map-core" />
+                <title>{p.country}: {p.count}</title>
+              </g>
+            );
+          })}
+        </svg>
+        {points.length === 0 && (
+          <div className="map-empty muted">
+            No geolocated indicators yet — the worker geolocates IP indicators on each enrichment cycle.
+          </div>
+        )}
+      </div>
+      <div className="panel map-side">
+        <div className="ov-card-title">Top Origins</div>
+        {points.length === 0 && <div className="muted ov-empty">Awaiting geo data…</div>}
+        {points.slice(0, 15).map((p, i) => (
+          <div className="ov-row" key={i}>
+            <span className="badge info">{p.count}</span>
+            <div className="ov-row-text">
+              <div className="ov-primary">{p.country}{p.code ? ` (${p.code})` : ""}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Overview (command center)
+
+function Overview({ reloadKey, stats }: { reloadKey: number; stats: Stats | null }) {
+  const [digest, setDigest] = useState<Digest | null>(null);
+
+  useEffect(() => {
+    api.digest().then(setDigest).catch(() => {});
+  }, [reloadKey]);
+
+  const tl = stats ? threatLevel(stats) : null;
+
+  return (
+    <>
+      {tl && (
+        <div className={`threat-banner tone-${tl.tone}`}>
+          <div className="tl-badge">
+            <span className="tl-num">{tl.level}</span>
+          </div>
+          <div className="tl-main">
+            <div className="tl-label">Threat level: {tl.label}</div>
+            <div className="tl-note">{digest?.headline ?? tl.note}</div>
+          </div>
+        </div>
+      )}
+
+      <div className="brief-head">
+        <div className="section-head" style={{ margin: 0 }}>
+          <h2>Daily Brief{digest && <span className="muted"> · {digest.date}</span>}</h2>
+        </div>
+        <div className="spacer" />
+        <button className="chip" onClick={() => window.open(api.digestUrl("html"), "_blank")} title="Open the HTML email brief">
+          <FileText size={14} /> Open email
+        </button>
+        <button className="chip" onClick={() => download(api.digestUrl("md"))} title="Download as Markdown">
+          <Download size={14} /> Markdown
+        </button>
+      </div>
+
+      <div className="overview-grid">
+        {digest?.sections.map((s) => (
+          <div className="panel ov-card" key={s.title}>
+            <div className="ov-card-title">{s.title}</div>
+            {s.items.length === 0 ? (
+              <div className="muted ov-empty">{s.empty}</div>
+            ) : (
+              s.items.map((it, idx) => (
+                <div className="ov-row" key={idx}>
+                  {it.badge && <span className={`badge ${toneBadgeClass(it.tone)}`}>{it.badge}</span>}
+                  <div className="ov-row-text">
+                    <div className="ov-primary">{it.primary}</div>
+                    {it.secondary && <div className="muted ov-secondary">{it.secondary}</div>}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        ))}
+        {!digest && <div className="muted" style={{ padding: 20 }}>Loading brief… (start the API to populate)</div>}
+      </div>
     </>
   );
 }
@@ -229,6 +481,18 @@ function VulnGrid({ reloadKey, sources, terms }: { reloadKey: number; sources: S
   }
   const arrow = (f: string) => (sort.field === f ? (sort.dir === "asc" ? " ▲" : " ▼") : "");
 
+  function exportParams(): VulnQuery {
+    const q: VulnQuery = { sort: sort.field, dir: sort.dir };
+    if (filters.q) q.q = filters.q;
+    if (filters.vendor) q.vendor = filters.vendor;
+    if (filters.source) q.source = filters.source;
+    if (filters.minRisk) q.minRisk = filters.minRisk;
+    if (filters.flag === "exploited") q.exploited = true;
+    if (filters.flag === "ransomware") q.ransomware = true;
+    if (filters.myStack) q.myStack = true;
+    return q;
+  }
+
   return (
     <div className="panel">
       <div className="grid-toolbar">
@@ -242,6 +506,10 @@ function VulnGrid({ reloadKey, sources, terms }: { reloadKey: number; sources: S
           {terms.length > 0 && <span className="muted"> ({terms.length})</span>}
         </button>
         {terms.length === 0 && <span className="muted">Add software via the My Stack panel to filter by what you run.</span>}
+        <div className="spacer" />
+        <button className="chip" onClick={() => download(api.exportVulnUrl(exportParams()))} title="Download current view as CSV">
+          <Download size={14} /> Export CSV
+        </button>
       </div>
       <table>
         <thead>
@@ -376,8 +644,29 @@ function IndicatorGrid({ reloadKey, sources }: { reloadKey: number; sources: Sou
   }
   const arrow = (f: string) => (sort.field === f ? (sort.dir === "asc" ? " ▲" : " ▼") : "");
 
+  function exportParams(): IndicatorQuery {
+    const q: IndicatorQuery = { sort: sort.field, dir: sort.dir };
+    if (filters.q) q.q = filters.q;
+    if (filters.type) q.type = filters.type;
+    if (filters.source) q.source = filters.source;
+    return q;
+  }
+
   return (
     <div className="panel">
+      <div className="grid-toolbar">
+        <span className="muted">Export current view:</span>
+        <div className="spacer" />
+        <button className="chip" onClick={() => download(api.exportIndicatorUrl(exportParams(), "csv"))} title="Download as CSV">
+          <Download size={14} /> CSV
+        </button>
+        <button className="chip" onClick={() => download(api.exportIndicatorUrl(exportParams(), "stix"))} title="STIX 2.1 bundle (OpenCTI/MISP)">
+          STIX
+        </button>
+        <button className="chip" onClick={() => download(api.exportIndicatorUrl(exportParams(), "blocklist"))} title="Plain blocklist for firewalls/IDS">
+          Blocklist
+        </button>
+      </div>
       <table>
         <thead>
           <tr>

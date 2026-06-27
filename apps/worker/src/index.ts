@@ -2,9 +2,10 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Queue, Worker, type Job } from "bullmq";
 import IORedis from "ioredis";
-import { createRepository } from "@omnisight/db";
+import { createRepository, composeDigest } from "@omnisight/db";
 import {
-  resolveConnector, resolveIndicatorConnector, seedSources, fetchEpss, fetchNvdCvss, sleep,
+  resolveConnector, resolveIndicatorConnector, resolveAdvisoryConnector,
+  seedSources, fetchEpss, fetchNvdCvss, fetchGeo, sleep,
 } from "@omnisight/connectors";
 
 // Load the repo-root .env so DATABASE_URL/REDIS_URL match the API process.
@@ -54,7 +55,15 @@ async function scheduleAll() {
   });
   await queue.add("enrich", {}, { delay: 8000, removeOnComplete: true });
 
-  console.log(`[worker] scheduled ${sources.length} source(s) + enrichment`);
+  // Daily brief at 07:00.
+  await queue.add("digest", {}, {
+    repeat: { pattern: "0 7 * * *" },
+    jobId: "repeat:digest",
+    removeOnComplete: 5,
+    removeOnFail: 5,
+  });
+
+  console.log(`[worker] scheduled ${sources.length} source(s) + enrichment + daily brief`);
 }
 
 /** Enrich tracked CVEs with EPSS (bulk) and CVSS from NVD (throttled). */
@@ -90,6 +99,21 @@ async function runEnrichment(): Promise<void> {
     await repo.signalChange("nvd");
     console.log(`[worker] nvd: enriched ${n} record(s)`);
   }
+
+  // Geolocate IP indicators (keyless ipwho.is; throttled to be polite).
+  const ips = await repo.ipsNeedingGeo(150);
+  let geoCount = 0;
+  for (const ip of ips) {
+    try {
+      const geo = await fetchGeo(ip);
+      if (geo) { await repo.setGeo(ip, geo); geoCount++; }
+    } catch { /* skip */ }
+    await sleep(350);
+  }
+  if (geoCount) {
+    await repo.signalChange("geo");
+    console.log(`[worker] geo: located ${geoCount} IP(s)`);
+  }
 }
 
 new Worker(
@@ -98,6 +122,11 @@ new Worker(
     if (job.name === "enrich") {
       await runEnrichment();
       return { enriched: true };
+    }
+    if (job.name === "digest") {
+      const d = await composeDigest(repo);
+      console.log(`[worker] daily brief — ${d.headline}`);
+      return { ok: true };
     }
     const source = (await repo.listSources()).find((s) => s.id === job.data.sourceId);
     if (!source) throw new Error(`source ${job.data.sourceId} not found`);
@@ -113,6 +142,15 @@ new Worker(
       const n = await repo.upsertIndicators(iocs);
       await repo.signalChange(source.id);
       console.log(`[worker] ${source.id}: ingested ${n} IOC(s)`);
+      return { ingested: n };
+    }
+
+    if (source.signalType === "advisory") {
+      const connector = resolveAdvisoryConnector(source);
+      const items = await connector.fetchAdvisories({ credentials });
+      const n = await repo.upsertAdvisories(items);
+      await repo.signalChange(source.id);
+      console.log(`[worker] ${source.id}: ingested ${n} advisory item(s)`);
       return { ingested: n };
     }
 
