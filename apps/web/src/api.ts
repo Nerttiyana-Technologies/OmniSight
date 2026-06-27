@@ -71,6 +71,15 @@ export interface MapPoint {
   count: number;
 }
 
+export interface MapIndicator {
+  value: string;
+  lat: number;
+  lng: number;
+  malware: string | null;
+  type: string;
+  source: string;
+}
+
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json() as Promise<T>;
@@ -108,6 +117,8 @@ function iocQs(params: IndicatorQuery): string {
 export const api = {
   stats: () => fetch("/api/stats").then(json<Stats>),
   map: () => fetch("/api/map").then(json<MapPoint[]>),
+  mapIndicators: (code: string) =>
+    fetch(`/api/map/indicators?code=${encodeURIComponent(code)}`).then(json<MapIndicator[]>),
   digest: () => fetch("/api/digest").then(json<Digest>),
   digestUrl: (format: "html" | "md") => `/api/digest?format=${format}`,
   vulnerabilities: (params: VulnQuery = {}) =>

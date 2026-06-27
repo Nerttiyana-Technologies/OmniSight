@@ -8,7 +8,7 @@ import {
   type Digest, type DigestTone,
 } from "@omnisight/shared";
 import {
-  api, type Stats, type VulnQuery, type IndicatorQuery, type AdvisoryQuery, type MapPoint,
+  api, type Stats, type VulnQuery, type IndicatorQuery, type AdvisoryQuery, type MapPoint, type MapIndicator,
 } from "./api.ts";
 import { makeProjector, topologyToGeometries, geomToPath, type Geom } from "./geo.ts";
 
@@ -289,9 +289,81 @@ async function loadWorld(): Promise<Geom[]> {
   return worldCache;
 }
 
+const MAP_W = 1000;
+const MAP_H = 500;
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+
 function MapView({ reloadKey }: { reloadKey: number }) {
   const [points, setPoints] = useState<MapPoint[]>([]);
   const [land, setLand] = useState<Geom[]>([]);
+  const [selected, setSelected] = useState<MapPoint | null>(null);
+  const [ips, setIps] = useState<MapIndicator[]>([]);
+  const [view, setView] = useState({ x: 0, y: 0, w: MAP_W, h: MAP_H });
+
+  const proj = makeProjector(MAP_W, MAP_H);
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const animRef = useRef<number | undefined>(undefined);
+  const panRef = useRef<{ px: number; py: number; vx: number; vy: number } | null>(null);
+  const viewRef = useRef(view);
+  viewRef.current = view;
+
+  // Smoothly tween the viewBox to a target frame.
+  const animateTo = useCallback((target: { x: number; y: number; w: number; h: number }) => {
+    if (animRef.current) cancelAnimationFrame(animRef.current);
+    const start = { ...viewRef.current };
+    const t0 = performance.now();
+    const dur = 550;
+    const ease = (t: number) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+    const step = (now: number) => {
+      const t = Math.min(1, (now - t0) / dur);
+      const k = ease(t);
+      setView({
+        x: start.x + (target.x - start.x) * k,
+        y: start.y + (target.y - start.y) * k,
+        w: start.w + (target.w - start.w) * k,
+        h: start.h + (target.h - start.h) * k,
+      });
+      if (t < 1) animRef.current = requestAnimationFrame(step);
+    };
+    animRef.current = requestAnimationFrame(step);
+  }, []);
+
+  // Wheel zoom centered on the cursor (native listener so preventDefault works).
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      if (animRef.current) cancelAnimationFrame(animRef.current);
+      const rect = svg.getBoundingClientRect();
+      const v = viewRef.current;
+      const mx = v.x + ((e.clientX - rect.left) / rect.width) * v.w;
+      const my = v.y + ((e.clientY - rect.top) / rect.height) * v.h;
+      const factor = e.deltaY > 0 ? 1.15 : 1 / 1.15;
+      const w = clamp(v.w * factor, 30, MAP_W);
+      const h = w * (MAP_H / MAP_W);
+      const x = clamp(mx - ((mx - v.x) / v.w) * w, 0, MAP_W - w);
+      const y = clamp(my - ((my - v.y) / v.h) * h, 0, MAP_H - h);
+      setView({ x, y, w, h });
+    };
+    svg.addEventListener("wheel", onWheel, { passive: false });
+    return () => svg.removeEventListener("wheel", onWheel);
+  }, []);
+
+  function onPointerDown(e: React.PointerEvent) {
+    panRef.current = { px: e.clientX, py: e.clientY, vx: viewRef.current.x, vy: viewRef.current.y };
+  }
+  function onPointerMove(e: React.PointerEvent) {
+    const pan = panRef.current;
+    const svg = svgRef.current;
+    if (!pan || !svg) return;
+    const rect = svg.getBoundingClientRect();
+    const v = viewRef.current;
+    const dx = (e.clientX - pan.px) * (v.w / rect.width);
+    const dy = (e.clientY - pan.py) * (v.h / rect.height);
+    setView({ ...v, x: clamp(pan.vx - dx, 0, MAP_W - v.w), y: clamp(pan.vy - dy, 0, MAP_H - v.h) });
+  }
+  function endPan() { panRef.current = null; }
 
   useEffect(() => {
     api.map().then(setPoints).catch(() => {});
@@ -301,59 +373,164 @@ function MapView({ reloadKey }: { reloadKey: number }) {
     loadWorld().then(setLand).catch(() => {}); // graceful: graticule-only if CDN blocked
   }, []);
 
-  const W = 1000;
-  const H = 500;
-  const proj = makeProjector(W, H);
+  // When a country is selected, fetch its IPs and zoom to fit them.
+  useEffect(() => {
+    if (!selected) { setIps([]); return; }
+    const code = selected.code ?? selected.country;
+    api.mapIndicators(code).then((list) => {
+      setIps(list);
+      if (list.length) {
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const i of list) {
+          const [x, y] = proj(i.lng, i.lat);
+          minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+          minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+        }
+        const padX = Math.max(50, (maxX - minX) * 0.4);
+        const padY = Math.max(35, (maxY - minY) * 0.4);
+        let x = minX - padX, y = minY - padY;
+        let w = (maxX - minX) + padX * 2, h = (maxY - minY) + padY * 2;
+        // keep the 2:1 aspect ratio
+        if (w / h < MAP_W / MAP_H) { const nw = h * (MAP_W / MAP_H); x -= (nw - w) / 2; w = nw; }
+        else { const nh = w * (MAP_H / MAP_W); y -= (nh - h) / 2; h = nh; }
+        w = Math.min(w, MAP_W); h = Math.min(h, MAP_H);
+        animateTo({ x: clamp(x, 0, MAP_W - w), y: clamp(y, 0, MAP_H - h), w, h });
+      } else {
+        const [cx, cy] = proj(selected.lng, selected.lat);
+        const w = 220, h = w * (MAP_H / MAP_W);
+        animateTo({ x: clamp(cx - w / 2, 0, MAP_W - w), y: clamp(cy - h / 2, 0, MAP_H - h), w, h });
+      }
+    }).catch(() => setIps([]));
+  }, [selected]);
+
+  function reset() {
+    setSelected(null);
+    animateTo({ x: 0, y: 0, w: MAP_W, h: MAP_H });
+  }
+
+  const scale = view.w / MAP_W; // shrink markers as we zoom so on-screen size stays steady
   const max = points.reduce((m, p) => Math.max(m, p.count), 1);
-  const radius = (c: number) => 4 + Math.sqrt(c / max) * 22;
+  const radius = (c: number) => (4 + Math.sqrt(c / max) * 22) * scale;
+
+  // Spread co-located IPs (city-level geo stacks many on one point) into a ring.
+  const sizeByKey = new Map<string, number>();
+  for (const ip of ips) {
+    const k = `${ip.lat.toFixed(2)},${ip.lng.toFixed(2)}`;
+    sizeByKey.set(k, (sizeByKey.get(k) ?? 0) + 1);
+  }
+  const seenByKey = new Map<string, number>();
+  const placedIps = ips.map((ip) => {
+    const k = `${ip.lat.toFixed(2)},${ip.lng.toFixed(2)}`;
+    const idx = seenByKey.get(k) ?? 0;
+    seenByKey.set(k, idx + 1);
+    const size = sizeByKey.get(k)!;
+    let [x, y] = proj(ip.lng, ip.lat);
+    if (size > 1) {
+      const ang = (2 * Math.PI * idx) / size;
+      const spread = 7 * scale * Math.min(2.6, 0.8 + size * 0.1);
+      x += Math.cos(ang) * spread;
+      y += Math.sin(ang) * spread;
+    }
+    return { ip, x, y };
+  });
 
   const graticule: React.ReactNode[] = [];
   for (let lng = -150; lng <= 150; lng += 30) {
     const [x] = proj(lng, 0);
-    graticule.push(<line key={`v${lng}`} x1={x} y1={0} x2={x} y2={H} />);
+    graticule.push(<line key={`v${lng}`} x1={x} y1={0} x2={x} y2={MAP_H} />);
   }
   for (let lat = -60; lat <= 60; lat += 30) {
     const [, y] = proj(0, lat);
-    graticule.push(<line key={`h${lat}`} x1={0} y1={y} x2={W} y2={y} />);
+    graticule.push(<line key={`h${lat}`} x1={0} y1={y} x2={MAP_W} y2={y} />);
   }
 
   return (
     <div className="map-layout">
       <div className="panel map-wrap">
-        <svg viewBox={`0 0 ${W} ${H}`} className="worldmap" preserveAspectRatio="xMidYMid meet">
-          <rect x={0} y={0} width={W} height={H} className="map-bg" />
+        <svg
+          ref={svgRef}
+          viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
+          className="worldmap"
+          preserveAspectRatio="xMidYMid meet"
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={endPan}
+          onPointerLeave={endPan}
+          onDoubleClick={() => {
+            const v = viewRef.current;
+            const w = clamp(v.w / 1.8, 30, MAP_W);
+            const h = w * (MAP_H / MAP_W);
+            animateTo({ x: clamp(v.x + (v.w - w) / 2, 0, MAP_W - w), y: clamp(v.y + (v.h - h) / 2, 0, MAP_H - h), w, h });
+          }}
+        >
+          <rect x={0} y={0} width={MAP_W} height={MAP_H} className="map-bg" />
           <g className="graticule">{graticule}</g>
           <g className="map-land-group">
-            {land.map((g, i) => <path key={i} className="map-land" d={geomToPath(g, proj)} />)}
+            {land.map((g, i) => <path key={i} className="map-land" d={geomToPath(g, proj)} style={{ strokeWidth: 0.5 * scale }} />)}
           </g>
-          {points.map((p, i) => {
+
+          {/* Aggregate country points (clickable) when nothing is selected */}
+          {!selected && points.map((p, i) => {
             const [x, y] = proj(p.lng, p.lat);
             return (
-              <g key={i}>
+              <g key={i} className="map-point" onClick={() => setSelected(p)}>
                 <circle cx={x} cy={y} r={radius(p.count)} className="map-glow" />
-                <circle cx={x} cy={y} r={Math.max(2.5, radius(p.count) * 0.34)} className="map-core" />
-                <title>{p.country}: {p.count}</title>
+                <circle cx={x} cy={y} r={Math.max(2.5 * scale, radius(p.count) * 0.34)} className="map-core" />
+                <title>{p.country}: {p.count} — click to zoom</title>
               </g>
             );
           })}
+
+          {/* Individual IP markers for the selected country (co-located ones spread into a ring) */}
+          {selected && placedIps.map(({ ip, x, y }, i) => (
+            <g key={i}>
+              <circle cx={x} cy={y} r={5 * scale} className="map-glow" />
+              <circle cx={x} cy={y} r={2.2 * scale} className="map-core" />
+              <title>{ip.value}{ip.malware ? ` — ${ip.malware}` : ""}</title>
+            </g>
+          ))}
         </svg>
         {points.length === 0 && (
           <div className="map-empty muted">
             No geolocated indicators yet — the worker geolocates IP indicators on each enrichment cycle.
           </div>
         )}
+        {selected && (
+          <button className="chip map-reset" onClick={reset}><ChevronLeft size={14} /> All origins</button>
+        )}
       </div>
+
       <div className="panel map-side">
-        <div className="ov-card-title">Top Origins</div>
-        {points.length === 0 && <div className="muted ov-empty">Awaiting geo data…</div>}
-        {points.slice(0, 15).map((p, i) => (
-          <div className="ov-row" key={i}>
-            <span className="badge info">{p.count}</span>
-            <div className="ov-row-text">
-              <div className="ov-primary">{p.country}{p.code ? ` (${p.code})` : ""}</div>
+        {!selected ? (
+          <>
+            <div className="ov-card-title">Top Origins</div>
+            {points.length === 0 && <div className="muted ov-empty">Awaiting geo data…</div>}
+            {points.slice(0, 20).map((p, i) => (
+              <div className="ov-row map-origin" key={i} onClick={() => setSelected(p)} title="Click to zoom">
+                <span className="badge info">{p.count}</span>
+                <div className="ov-row-text">
+                  <div className="ov-primary">{p.country}{p.code ? ` (${p.code})` : ""}</div>
+                </div>
+              </div>
+            ))}
+          </>
+        ) : (
+          <>
+            <div className="ov-card-title">
+              {selected.country} · {ips.length} indicator{ips.length === 1 ? "" : "s"}
             </div>
-          </div>
-        ))}
+            {ips.length === 0 && <div className="muted ov-empty">No located indicators.</div>}
+            {ips.map((ip, i) => (
+              <div className="ov-row" key={i}>
+                <span className={`badge ioc-${ip.type}`}>{ip.type}</span>
+                <div className="ov-row-text">
+                  <div className="ov-primary ioc-value" style={{ maxWidth: "100%" }}>{ip.value}</div>
+                  {ip.malware && <div className="muted ov-secondary">{ip.malware}</div>}
+                </div>
+              </div>
+            ))}
+          </>
+        )}
       </div>
     </div>
   );

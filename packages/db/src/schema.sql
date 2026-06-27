@@ -67,6 +67,12 @@ CREATE TABLE IF NOT EXISTS indicators (
   PRIMARY KEY (source, id)
 );
 
+-- Self-migration: add geo columns to indicators tables created before they existed.
+ALTER TABLE indicators ADD COLUMN IF NOT EXISTS country      TEXT;
+ALTER TABLE indicators ADD COLUMN IF NOT EXISTS country_code TEXT;
+ALTER TABLE indicators ADD COLUMN IF NOT EXISTS lat          DOUBLE PRECISION;
+ALTER TABLE indicators ADD COLUMN IF NOT EXISTS lng          DOUBLE PRECISION;
+
 CREATE INDEX IF NOT EXISTS idx_ioc_lastseen   ON indicators (last_seen DESC);
 CREATE INDEX IF NOT EXISTS idx_ioc_type       ON indicators (type);
 CREATE INDEX IF NOT EXISTS idx_ioc_malware    ON indicators (malware);

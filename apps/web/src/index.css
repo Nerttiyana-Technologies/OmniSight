@@ -237,6 +237,13 @@ tr:hover td { background: var(--bg-elev-2); }
 .map-core { fill: var(--critical); opacity: 0.9; }
 .map-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; padding: 24px; }
 .map-side { padding: 16px 18px; max-height: 520px; overflow: auto; }
+.worldmap { cursor: grab; touch-action: none; user-select: none; }
+.worldmap:active { cursor: grabbing; }
+.map-point { cursor: pointer; }
+.map-point:hover .map-glow { opacity: 0.32; }
+.map-origin { cursor: pointer; border-radius: 8px; padding-left: 6px; padding-right: 6px; }
+.map-origin:hover { background: var(--bg-elev-2); }
+.map-reset { position: absolute; top: 18px; left: 18px; }
 
 .risk-cell { display: flex; align-items: center; gap: 10px; }
 .risk-bar { width: 64px; height: 6px; border-radius: 4px; background: var(--bg-elev-2); overflow: hidden; }
