@@ -67,8 +67,22 @@ morning (07:00) — schedule-ready for delivery.
 
 Both grids export the **current filtered view**. Vulnerabilities export to CSV;
 indicators export to **CSV**, a **STIX 2.1 bundle** (importable into OpenCTI /
-MISP), or a plain **blocklist** (IPs/domains/URLs/hashes) for firewalls and IDS —
-so OmniSight pushes intel into the rest of your stack rather than trapping it.
+MISP), a plain **blocklist** (IPs/domains/URLs/hashes) for firewalls and IDS, or
+**Sigma detection rules** for your SIEM — so OmniSight pushes intel into the rest
+of your stack rather than trapping it.
+
+### Cross-source correlation
+
+The Overview surfaces **CVE↔IOC correlations**: CVE references found inside
+indicator tags/threat context are linked to tracked vulnerabilities (risk-ranked),
+showing which CVEs the active indicators relate to. (Linkage is only as rich as
+the feeds — IOC sources cite CVEs intermittently.)
+
+### Daily brief email
+
+When SMTP is configured (`SMTP_HOST` + `DIGEST_TO` in `.env`), the worker emails
+the executive HTML brief each morning. Set `DIGEST_ON_START=true` to send a test
+on boot.
 
 ### Real-time & enrichment
 
