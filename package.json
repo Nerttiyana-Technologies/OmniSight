@@ -1,0 +1,22 @@
+{
+  "name": "omnisight",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Open-source real-time cyber situational-awareness platform",
+  "packageManager": "pnpm@11.9.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "typecheck": "turbo run typecheck",
+    "start:api": "pnpm --filter @omnisight/api start",
+    "start:worker": "pnpm --filter @omnisight/worker start",
+    "connector:dry-run": "pnpm --filter @omnisight/connectors dry-run"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.3",
+    "typescript": "^5.6.3"
+  }
+}

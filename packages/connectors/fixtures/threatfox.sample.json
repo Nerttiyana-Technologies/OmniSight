@@ -1,0 +1,57 @@
+{
+  "query_status": "ok",
+  "data": [
+    {
+      "id": "1200001",
+      "ioc": "185.220.101.45:443",
+      "ioc_type": "ip:port",
+      "threat_type": "botnet_cc",
+      "threat_type_desc": "Indicator that identifies a botnet command&control server (C&C)",
+      "malware": "win.cobalt_strike",
+      "malware_printable": "Cobalt Strike",
+      "confidence_level": 100,
+      "first_seen": "2026-06-26 10:00:00 UTC",
+      "last_seen": "2026-06-27 09:30:00 UTC",
+      "reference": "https://threatfox.abuse.ch/ioc/1200001/",
+      "tags": ["cobaltstrike", "c2"]
+    },
+    {
+      "id": "1200002",
+      "ioc": "malicious-delivery.example.com",
+      "ioc_type": "domain",
+      "threat_type": "payload_delivery",
+      "threat_type_desc": "Indicator that identifies a malware payload delivery server",
+      "malware": "win.emotet",
+      "malware_printable": "Emotet",
+      "confidence_level": 75,
+      "first_seen": "2026-06-25 08:00:00 UTC",
+      "last_seen": null,
+      "reference": null,
+      "tags": null
+    },
+    {
+      "id": "1200003",
+      "ioc": "http://bad.example/payload.exe",
+      "ioc_type": "url",
+      "threat_type": "payload_delivery",
+      "malware_printable": "Qakbot",
+      "confidence_level": 50,
+      "first_seen": "2026-06-26 12:00:00 UTC",
+      "last_seen": "2026-06-26 18:00:00 UTC",
+      "reference": "https://threatfox.abuse.ch/ioc/1200003/",
+      "tags": ["qakbot"]
+    },
+    {
+      "id": "1200004",
+      "ioc": "44d88612fea8a8f36de82e1278abb02f",
+      "ioc_type": "md5_hash",
+      "threat_type": "payload",
+      "malware_printable": "Agent Tesla",
+      "confidence_level": 90,
+      "first_seen": "2026-06-24 06:00:00 UTC",
+      "last_seen": "2026-06-27 01:00:00 UTC",
+      "reference": "https://threatfox.abuse.ch/ioc/1200004/",
+      "tags": ["agenttesla", "stealer"]
+    }
+  ]
+}
