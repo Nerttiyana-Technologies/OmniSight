@@ -85,6 +85,12 @@ app.get("/api/stats", async () => repo.stats());
 
 app.get("/api/map", async () => repo.mapData());
 
+app.get("/api/map/indicators", async (req) => {
+  const code = (req.query as { code?: string }).code;
+  if (!code) return [];
+  return repo.mapIndicators(code, 500);
+});
+
 app.get("/api/digest", async (req, reply) => {
   const digest = await composeDigest(repo);
   const format = (req.query as { format?: string }).format;

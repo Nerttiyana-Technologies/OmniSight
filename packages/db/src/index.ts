@@ -70,6 +70,15 @@ export interface MapPoint {
   count: number;
 }
 
+export interface MapIndicator {
+  value: string;
+  lat: number;
+  lng: number;
+  malware: string | null;
+  type: string;
+  source: string;
+}
+
 export interface AdvisoryListOptions {
   limit?: number;
   offset?: number;
@@ -109,6 +118,8 @@ export interface Repository {
   setGeo(value: string, geo: GeoPatch): Promise<void>;
   /** Indicator counts aggregated by country for the map. */
   mapData(): Promise<MapPoint[]>;
+  /** Individual geolocated indicators for one country (drill-down). */
+  mapIndicators(country: string, limit?: number): Promise<MapIndicator[]>;
   upsertSource(source: Source): Promise<void>;
   listSources(): Promise<Source[]>;
   stats(): Promise<Stats>;
@@ -228,6 +239,17 @@ export class InMemoryRepository implements Repository {
       else byCountry.set(key, { country: i.country ?? "Unknown", code: i.countryCode, lat: i.lat, lng: i.lng, count: 1 });
     }
     return [...byCountry.values()].sort((a, b) => b.count - a.count);
+  }
+
+  async mapIndicators(country: string, limit = 500): Promise<MapIndicator[]> {
+    const out: MapIndicator[] = [];
+    for (const i of this.indicators.values()) {
+      if (i.lat == null || i.lng == null) continue;
+      if (i.countryCode !== country && i.country !== country) continue;
+      out.push({ value: i.value, lat: i.lat, lng: i.lng, malware: i.malware, type: i.type, source: i.source });
+      if (out.length >= limit) break;
+    }
+    return out;
   }
 
   async pageIndicators(opts: IndicatorListOptions = {}): Promise<IndicatorPage> {
@@ -765,6 +787,23 @@ export class PostgresRepository implements Repository {
          ORDER BY count DESC`,
     );
     return rows.map((r) => ({ country: r.country, code: r.code, lat: r.lat, lng: r.lng, count: r.count }));
+  }
+
+  async mapIndicators(country: string, limit = 500): Promise<MapIndicator[]> {
+    const { rows } = await this.pool.query(
+      `SELECT value, lat, lng, malware, type, source FROM indicators
+         WHERE (country_code = $1 OR country = $1) AND lat IS NOT NULL AND lng IS NOT NULL
+         LIMIT $2`,
+      [country, limit],
+    );
+    return rows.map((r) => ({
+      value: r.value as string,
+      lat: Number(r.lat),
+      lng: Number(r.lng),
+      malware: (r.malware as string) ?? null,
+      type: r.type as string,
+      source: r.source as string,
+    }));
   }
 
   async stats(): Promise<Stats> {

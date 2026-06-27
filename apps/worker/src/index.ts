@@ -43,7 +43,8 @@ async function scheduleAll() {
       },
     );
     // Kick an immediate first run so data lands without waiting for the cron.
-    await queue.add(source.id, { sourceId: source.id }, { removeOnComplete: true });
+    // Stable jobId so repeated restarts don't stack duplicate immediate runs.
+    await queue.add(source.id, { sourceId: source.id }, { jobId: `now-${source.id}`, removeOnComplete: true });
   }
 
   // Enrichment: every 30 min, plus once shortly after the initial ingest.
@@ -53,7 +54,16 @@ async function scheduleAll() {
     removeOnComplete: 20,
     removeOnFail: 20,
   });
-  await queue.add("enrich", {}, { delay: 8000, removeOnComplete: true });
+  await queue.add("enrich", {}, { delay: 8000, jobId: "now-enrich", removeOnComplete: true });
+
+  // Geolocation: every 15 min, plus shortly after the first indicator ingest.
+  await queue.add("geo", {}, {
+    repeat: { pattern: "*/15 * * * *" },
+    jobId: "repeat:geo",
+    removeOnComplete: 10,
+    removeOnFail: 10,
+  });
+  await queue.add("geo", {}, { delay: 20000, jobId: "now-geo", removeOnComplete: true });
 
   // Daily brief at 07:00.
   await queue.add("digest", {}, {
@@ -66,8 +76,14 @@ async function scheduleAll() {
   console.log(`[worker] scheduled ${sources.length} source(s) + enrichment + daily brief`);
 }
 
+let enrichRunning = false;
+let geoRunning = false;
+
 /** Enrich tracked CVEs with EPSS (bulk) and CVSS from NVD (throttled). */
 async function runEnrichment(): Promise<void> {
+  if (enrichRunning) { console.log("[worker] enrich: already running, skipping"); return; }
+  enrichRunning = true;
+  try {
   // EPSS — keyless, up to 100 CVEs/request.
   const epssIds = await repo.distinctCveIds("epss", 500);
   if (epssIds.length) {
@@ -99,20 +115,44 @@ async function runEnrichment(): Promise<void> {
     await repo.signalChange("nvd");
     console.log(`[worker] nvd: enriched ${n} record(s)`);
   }
-
-  // Geolocate IP indicators (keyless ipwho.is; throttled to be polite).
-  const ips = await repo.ipsNeedingGeo(150);
-  let geoCount = 0;
-  for (const ip of ips) {
-    try {
-      const geo = await fetchGeo(ip);
-      if (geo) { await repo.setGeo(ip, geo); geoCount++; }
-    } catch { /* skip */ }
-    await sleep(350);
+  } finally {
+    enrichRunning = false;
   }
-  if (geoCount) {
-    await repo.signalChange("geo");
-    console.log(`[worker] geo: located ${geoCount} IP(s)`);
+}
+
+/** Geolocate IP indicators (keyless ipwho.is; throttled). Its own job so the
+ *  map populates quickly without waiting on the slow NVD loop. */
+async function runGeo(): Promise<void> {
+  if (geoRunning) { console.log("[worker] geo: already running, skipping"); return; }
+  geoRunning = true;
+  try {
+    let ips: string[] = [];
+    try {
+      ips = await repo.ipsNeedingGeo(150);
+    } catch (e) {
+      console.error(`[worker] geo: query failed — ${(e as Error).message}`);
+      return;
+    }
+    console.log(`[worker] geo: ${ips.length} IP(s) to locate`);
+    if (ips.length === 0) return;
+    let located = 0;
+    let failed = 0;
+    let firstErr = "";
+    for (const ip of ips) {
+      try {
+        const geo = await fetchGeo(ip);
+        if (geo) { await repo.setGeo(ip, geo); located++; }
+        else failed++;
+      } catch (e) {
+        failed++;
+        if (!firstErr) firstErr = (e as Error).message;
+      }
+      await sleep(350);
+    }
+    console.log(`[worker] geo: located ${located}, failed ${failed}${firstErr ? ` (${firstErr})` : ""}`);
+    if (located) await repo.signalChange("geo");
+  } finally {
+    geoRunning = false;
   }
 }
 
@@ -122,6 +162,10 @@ new Worker(
     if (job.name === "enrich") {
       await runEnrichment();
       return { enriched: true };
+    }
+    if (job.name === "geo") {
+      await runGeo();
+      return { ok: true };
     }
     if (job.name === "digest") {
       const d = await composeDigest(repo);
@@ -142,6 +186,8 @@ new Worker(
       const n = await repo.upsertIndicators(iocs);
       await repo.signalChange(source.id);
       console.log(`[worker] ${source.id}: ingested ${n} IOC(s)`);
+      // Kick a geo pass now that fresh IPs have landed (avoids racing the timer).
+      if (n > 0) await queue.add("geo", {}, { removeOnComplete: true, jobId: `geo-after-${source.id}` });
       return { ingested: n };
     }
 
@@ -161,7 +207,9 @@ new Worker(
     console.log(`[worker] ${source.id}: ingested ${n}`);
     return { ingested: n };
   },
-  { connection },
+  // Concurrency >1 so the quick jobs (geo, news, ingest) aren't blocked behind
+  // the slow NVD enrichment loop. lockDuration covers multi-minute jobs.
+  { connection, concurrency: 4, lockDuration: 120000 },
 );
 
 await scheduleAll();
