@@ -36,6 +36,7 @@ export const SourceSchema = z.object({
   enabled: z.boolean().default(true),
   requiresAuth: z.boolean().default(false),
   reliability: z.enum(["A", "B", "C", "D", "F"]).default("C"), // admiralty-style source grade
+  sector: z.string().nullable().optional(), // relevance tag, e.g. "finance", "healthcare"
   config: z.record(z.unknown()).default({}),
   createdAt: z.string().nullable().optional(), // set by the store
   lastRunAt: z.string().nullable().optional(),
@@ -469,6 +470,69 @@ export function normalizeHibpBreaches(raw: unknown, domain: string): Breach[] {
       verified: Boolean(b.IsVerified),
       fetchedAt,
     }));
+}
+
+// --- Source reliability weighting -------------------------------------------
+
+/** Multiplier for blending source admiralty grade into risk ranking. */
+export function reliabilityWeight(grade: string | null | undefined): number {
+  switch ((grade ?? "C").toUpperCase()) {
+    case "A": return 1.0;
+    case "B": return 0.9;
+    case "C": return 0.8;
+    case "D": return 0.65;
+    case "F": return 0.5;
+    default: return 0.8;
+  }
+}
+
+// --- ATT&CK matrix (tactic grouping) ----------------------------------------
+
+/** Enterprise ATT&CK tactics in kill-chain order, plus buckets for ATLAS/other. */
+export const ATTACK_TACTICS: { id: string; name: string }[] = [
+  { id: "reconnaissance", name: "Reconnaissance" },
+  { id: "resource-development", name: "Resource Development" },
+  { id: "initial-access", name: "Initial Access" },
+  { id: "execution", name: "Execution" },
+  { id: "persistence", name: "Persistence" },
+  { id: "privilege-escalation", name: "Privilege Escalation" },
+  { id: "defense-evasion", name: "Defense Evasion" },
+  { id: "credential-access", name: "Credential Access" },
+  { id: "discovery", name: "Discovery" },
+  { id: "lateral-movement", name: "Lateral Movement" },
+  { id: "collection", name: "Collection" },
+  { id: "command-and-control", name: "Command & Control" },
+  { id: "exfiltration", name: "Exfiltration" },
+  { id: "impact", name: "Impact" },
+  { id: "atlas", name: "ATLAS (AI/ML)" },
+  { id: "other", name: "Other / Uncategorized" },
+];
+
+// Compact technique→primary-tactic map for the most common techniques. Not
+// exhaustive (full ATT&CK has ~600); unmapped IDs fall into "other".
+const TECHNIQUE_TACTIC: Record<string, string> = {
+  T1595: "reconnaissance", T1592: "reconnaissance", T1589: "reconnaissance", T1590: "reconnaissance", T1598: "reconnaissance", T1597: "reconnaissance",
+  T1583: "resource-development", T1584: "resource-development", T1587: "resource-development", T1588: "resource-development", T1608: "resource-development", T1585: "resource-development", T1586: "resource-development",
+  T1190: "initial-access", T1133: "initial-access", T1566: "initial-access", T1078: "initial-access", T1195: "initial-access", T1199: "initial-access", T1200: "initial-access", T1189: "initial-access", T1091: "initial-access",
+  T1059: "execution", T1203: "execution", T1204: "execution", T1106: "execution", T1053: "execution", T1129: "execution", T1569: "execution", T1047: "execution", T1072: "execution",
+  T1547: "persistence", T1543: "persistence", T1136: "persistence", T1505: "persistence", T1098: "persistence", T1197: "persistence", T1574: "persistence", T1037: "persistence", T1546: "persistence",
+  T1548: "privilege-escalation", T1055: "privilege-escalation", T1068: "privilege-escalation", T1484: "privilege-escalation", T1611: "privilege-escalation",
+  T1562: "defense-evasion", T1070: "defense-evasion", T1027: "defense-evasion", T1140: "defense-evasion", T1112: "defense-evasion", T1218: "defense-evasion", T1036: "defense-evasion", T1497: "defense-evasion", T1620: "defense-evasion", T1564: "defense-evasion", T1222: "defense-evasion",
+  T1110: "credential-access", T1003: "credential-access", T1555: "credential-access", T1056: "credential-access", T1552: "credential-access", T1558: "credential-access", T1212: "credential-access", T1187: "credential-access", T1539: "credential-access",
+  T1087: "discovery", T1083: "discovery", T1046: "discovery", T1057: "discovery", T1018: "discovery", T1082: "discovery", T1016: "discovery", T1033: "discovery", T1049: "discovery", T1518: "discovery", T1069: "discovery", T1007: "discovery",
+  T1021: "lateral-movement", T1210: "lateral-movement", T1570: "lateral-movement", T1080: "lateral-movement", T1550: "lateral-movement",
+  T1560: "collection", T1005: "collection", T1114: "collection", T1213: "collection", T1119: "collection", T1115: "collection", T1123: "collection",
+  T1071: "command-and-control", T1105: "command-and-control", T1572: "command-and-control", T1090: "command-and-control", T1573: "command-and-control", T1219: "command-and-control", T1568: "command-and-control", T1095: "command-and-control", T1102: "command-and-control",
+  T1041: "exfiltration", T1048: "exfiltration", T1567: "exfiltration", T1029: "exfiltration", T1011: "exfiltration",
+  T1486: "impact", T1490: "impact", T1489: "impact", T1498: "impact", T1499: "impact", T1485: "impact", T1491: "impact", T1561: "impact", T1496: "impact", T1531: "impact", T1565: "impact",
+};
+
+/** Map a technique ID to its primary tactic id. */
+export function tacticForTechnique(id: string): string {
+  const up = id.toUpperCase();
+  if (up.startsWith("AML")) return "atlas";
+  const base = up.split(".")[0]!; // strip sub-technique
+  return TECHNIQUE_TACTIC[base] ?? "other";
 }
 
 // --- Typosquat / look-alike domain generation -------------------------------

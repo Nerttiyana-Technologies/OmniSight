@@ -20,6 +20,7 @@ export interface IndicatorQuery {
   q?: string;
   source?: string;
   maxAgeDays?: number;
+  minConfidence?: number;
   sort?: string;
   dir?: "asc" | "desc";
 }
@@ -195,12 +196,59 @@ export interface TyposquatGroup {
   candidates: string[];
 }
 
+export interface MentionGroup {
+  term: string;
+  advisories: { title: string; url: string; source: string; published: string | null }[];
+  indicators: { value: string; source: string; malware: string | null }[];
+}
+
+export interface DetectionRule {
+  id: string;
+  name: string;
+  format: "sigma" | "yara" | "snort" | "other";
+  content: string;
+  techniques: string[];
+  enabled: boolean;
+  createdAt: string;
+}
+
+export interface DetectionGaps {
+  covered: string[];
+  gaps: AttackTechnique[];
+  ruleCount: number;
+}
+
+export interface AttackMatrixColumn {
+  tactic: string;
+  name: string;
+  techniques: { id: string; count: number }[];
+}
+
+export interface CveEntity {
+  cveId: string;
+  title: string;
+  riskScore: number;
+  knownExploited: boolean;
+  sources: { source: string; reliability: string }[];
+}
+
+export interface Rfi {
+  id: string;
+  question: string;
+  context: string;
+  status: "open" | "answered" | "closed";
+  answer: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface IocEnrichment {
   value: string;
   type: string;
   shodan: { ports: number[]; hostnames: string[]; tags: string[]; vulns: string[]; cpes: string[] } | null;
   greynoise: { noise: boolean; riot: boolean; classification: string; name: string | null; lastSeen: string | null } | null;
   abuseipdb: { score: number; reports: number; countryCode: string | null; isp: string | null } | null;
+  pulsedive: { iid: number | null; risk: string; riskRecommended: string; threats: { name: string; category: string }[]; feeds: string[]; lastSeen: string | null } | null;
   errors: string[];
 }
 
@@ -261,6 +309,7 @@ function iocQs(params: IndicatorQuery): string {
   if (params.q) qs.set("q", params.q);
   if (params.source) qs.set("source", params.source);
   if (params.maxAgeDays) qs.set("maxAgeDays", String(params.maxAgeDays));
+  if (params.minConfidence) qs.set("minConfidence", String(params.minConfidence));
   if (params.sort) qs.set("sort", params.sort);
   if (params.dir) qs.set("dir", params.dir);
   return qs.toString();
@@ -327,6 +376,24 @@ export const api = {
   setSourceEnabled: (id: string, enabled: boolean) =>
     af(`/api/sources/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled }) }).then(json<{ ok: boolean }>),
   deleteSource: (id: string) => af(`/api/sources/${encodeURIComponent(id)}`, { method: "DELETE" }).then(json<{ ok: boolean }>),
+  setSourceSector: (id: string, sector: string | null) =>
+    af(`/api/sources/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ sector }) }).then(json<{ ok: boolean }>),
+  mentions: () => af("/api/mentions").then(json<MentionGroup[]>),
+  detectionRules: () => af("/api/detection-rules").then(json<DetectionRule[]>),
+  createDetectionRule: (body: Partial<DetectionRule>) =>
+    af("/api/detection-rules", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).then(json<DetectionRule>),
+  updateDetectionRule: (id: string, patch: Partial<DetectionRule>) =>
+    af(`/api/detection-rules/${id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(patch) }).then(json<{ ok: boolean }>),
+  deleteDetectionRule: (id: string) => af(`/api/detection-rules/${id}`, { method: "DELETE" }).then(json<{ ok: boolean }>),
+  detectionGaps: () => af("/api/detection-gaps").then(json<DetectionGaps>),
+  attackMatrix: () => af("/api/attack/matrix").then(json<AttackMatrixColumn[]>),
+  entities: () => af("/api/entities").then(json<CveEntity[]>),
+  rfis: () => af("/api/rfis").then(json<Rfi[]>),
+  createRfi: (question: string, context: string) =>
+    af("/api/rfis", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question, context }) }).then(json<Rfi>),
+  updateRfi: (id: string, patch: Partial<Pick<Rfi, "status" | "answer" | "question" | "context">>) =>
+    af(`/api/rfis/${id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(patch) }).then(json<{ ok: boolean }>),
+  deleteRfi: (id: string) => af(`/api/rfis/${id}`, { method: "DELETE" }).then(json<{ ok: boolean }>),
   feedback: () => af("/api/feedback").then(json<Record<string, Verdict>>),
   setFeedback: (ref: string, verdict: Verdict | null) =>
     af("/api/feedback", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ref, verdict }) }).then(json<{ ok: boolean }>),

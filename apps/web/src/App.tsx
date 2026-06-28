@@ -4,9 +4,10 @@ import {
   Activity, Gauge, ChevronLeft, ChevronRight, Crosshair, Server, X, Download, FileText, Newspaper, ExternalLink,
   ScanSearch, Copy, Package, LogOut, Users as UsersIcon, Lock, Trash2, Sparkles, ScrollText, Bug, KeyRound,
   Workflow, Link2, ShieldOff, Bookmark, ThumbsUp, ThumbsDown, Globe, Power, Play,
+  ShieldCheck, Grid3x3, Layers, HelpCircle,
 } from "lucide-react";
 import {
-  riskBand, threatLevel, extractIocs, defang, roleAtLeast, type Vulnerability, type Indicator, type Advisory, type NewSource, type Source,
+  riskBand, threatLevel, extractIocs, defang, roleAtLeast, reliabilityWeight, type Vulnerability, type Indicator, type Advisory, type NewSource, type Source,
   type Digest, type DigestTone, type ExtractedIocs, type User,
 } from "@omnisight/shared";
 import {
@@ -111,6 +112,12 @@ export function App() {
   const [showRules, setShowRules] = useState(false);
   const [showSources, setShowSources] = useState(false);
 
+  // Analyst tools
+  const [showDetection, setShowDetection] = useState(false);
+  const [showMatrix, setShowMatrix] = useState(false);
+  const [showEntities, setShowEntities] = useState(false);
+  const [showRfi, setShowRfi] = useState(false);
+
   const REFRESH_MS = 15000;
   const bump = useCallback(() => setReloadKey((k) => k + 1), []);
 
@@ -198,6 +205,20 @@ export function App() {
         {aiEnabled && (
           <button className="icon-btn" data-tooltip="AI correlation suggestions" aria-label="AI correlations" onClick={() => setShowCorrelate(true)}>
             <Link2 size={18} />
+          </button>
+        )}
+        <button className="icon-btn" data-tooltip="ATT&CK matrix" aria-label="ATT&CK matrix" onClick={() => setShowMatrix(true)}>
+          <Grid3x3 size={18} />
+        </button>
+        <button className="icon-btn" data-tooltip="Entity resolution (CVE across sources)" aria-label="Entities" onClick={() => setShowEntities(true)}>
+          <Layers size={18} />
+        </button>
+        <button className="icon-btn" data-tooltip="RFI tracker" aria-label="RFIs" onClick={() => setShowRfi(true)}>
+          <HelpCircle size={18} />
+        </button>
+        {canWrite && (
+          <button className="icon-btn" data-tooltip="Detection rule library" aria-label="Detection rules" onClick={() => setShowDetection(true)}>
+            <ShieldCheck size={18} />
           </button>
         )}
         {isAdmin && (
@@ -354,6 +375,10 @@ export function App() {
         {showAudit && <AuditPanel onClose={() => setShowAudit(false)} />}
         {showRules && <RulesPanel onClose={() => setShowRules(false)} />}
         {showSources && <SourcesPanel onClose={() => setShowSources(false)} onChange={bump} />}
+        {showDetection && <DetectionPanel onClose={() => setShowDetection(false)} canWrite={canWrite} />}
+        {showMatrix && <MatrixModal onClose={() => setShowMatrix(false)} />}
+        {showEntities && <EntitiesModal onClose={() => setShowEntities(false)} />}
+        {showRfi && <RfiPanel onClose={() => setShowRfi(false)} canWrite={canWrite} />}
         {showAsk && <AskAiModal onClose={() => setShowAsk(false)} onDetail={onDetail} />}
         {showCorrelate && <CorrelateModal onClose={() => setShowCorrelate(false)} />}
         {showExtract && <ExtractModal onClose={() => setShowExtract(false)} onEnrich={onEnrich} />}
@@ -888,7 +913,11 @@ function VulnGrid({ reloadKey, sources, terms, onDetail }: { reloadKey: number; 
   const [filters, setFilters] = useState<VulnFilters>(EMPTY_VULN_FILTERS);
   const [sort, setSort] = useState<{ field: string; dir: "asc" | "desc" }>({ field: "risk", dir: "desc" });
   const [loading, setLoading] = useState(false);
+  const [feedback, setFeedback] = useState<Record<string, Verdict>>({});
+  const [hideFp, setHideFp] = useState(false);
+  const [weighted, setWeighted] = useState(false);
   const pages = Math.max(1, Math.ceil(total / pageSize));
+  useEffect(() => { api.feedback().then(setFeedback).catch(() => {}); }, [reloadKey]);
 
   const ref = useRef({ page, pageSize, filters, sort });
   ref.current = { page, pageSize, filters, sort };
@@ -937,6 +966,16 @@ function VulnGrid({ reloadKey, sources, terms, onDetail }: { reloadKey: number; 
     return q;
   }
 
+  // Apply client-side feedback hiding + reliability weighting to the loaded page.
+  let view = items;
+  if (hideFp) view = view.filter((x) => feedback[`cve:${x.cveId ?? x.id}`] !== "false_positive");
+  if (weighted) {
+    view = [...view].sort((a, b) =>
+      b.riskScore * reliabilityWeight(reliabilityOf(sources, b.source)) -
+      a.riskScore * reliabilityWeight(reliabilityOf(sources, a.source)),
+    );
+  }
+
   return (
     <div className="panel">
       <div className="grid-toolbar">
@@ -950,6 +989,12 @@ function VulnGrid({ reloadKey, sources, terms, onDetail }: { reloadKey: number; 
           {terms.length > 0 && <span className="muted"> ({terms.length})</span>}
         </button>
         {terms.length === 0 && <span className="muted">Add software via the My Stack panel to filter by what you run.</span>}
+        <button className={`chip ${weighted ? "on" : ""}`} onClick={() => setWeighted((v) => !v)} title="Re-rank the current view by source reliability grade">
+          <ShieldAlert size={14} /> Weight by grade
+        </button>
+        <button className={`chip ${hideFp ? "on" : ""}`} onClick={() => setHideFp((v) => !v)} title="Hide indicators marked false-positive">
+          <ThumbsDown size={14} /> Hide FPs
+        </button>
         <div className="spacer" />
         <SavedSearchBar
           kind="vuln"
@@ -1010,12 +1055,13 @@ function VulnGrid({ reloadKey, sources, terms, onDetail }: { reloadKey: number; 
           </tr>
         </thead>
         <tbody>
-          {items.length === 0 && (
+          {view.length === 0 && (
             <tr><td colSpan={9} className="muted" style={{ padding: 28, textAlign: "center" }}>
               {total === 0 ? "No vulnerabilities yet. Start the API and worker to ingest data." : "No matches — try clearing filters."}
             </td></tr>
           )}
-          {items.map((v) => {
+          {view.map((v) => {
+            const verdict = feedback[`cve:${v.cveId ?? v.id}`];
             const band = riskBand(v.riskScore);
             const mine = inStack(v, terms);
             return (
@@ -1031,6 +1077,7 @@ function VulnGrid({ reloadKey, sources, terms, onDetail }: { reloadKey: number; 
                   <span className="pivot" onClick={() => onDetail(v)} title="View full details">
                     {v.cveId ?? v.id}
                   </span>
+                  {verdict && <span className={`fb-badge ${verdict}`} title={verdict === "confirmed" ? "Confirmed" : "False positive"}>{verdict === "confirmed" ? "✓" : "FP"}</span>}
                 </td>
                 <td>{v.title}</td>
                 <td className="muted">{[v.vendor, v.product].filter(Boolean).join(" / ") || "—"}</td>
@@ -1056,8 +1103,8 @@ function VulnGrid({ reloadKey, sources, terms, onDetail }: { reloadKey: number; 
 // ---------------------------------------------------------------------------
 // Indicators grid
 
-interface IocFilters { q: string; type: string; source: string; fresh: boolean }
-const EMPTY_IOC_FILTERS: IocFilters = { q: "", type: "", source: "", fresh: false };
+interface IocFilters { q: string; type: string; source: string; fresh: boolean; minConf: number }
+const EMPTY_IOC_FILTERS: IocFilters = { q: "", type: "", source: "", fresh: false, minConf: 0 };
 
 function IndicatorGrid({ reloadKey, sources, onEnrich, canWrite }: { reloadKey: number; sources: Source[]; onEnrich: (value: string, type: string) => void; canWrite: boolean }) {
   const [items, setItems] = useState<Indicator[]>([]);
@@ -1081,6 +1128,7 @@ function IndicatorGrid({ reloadKey, sources, onEnrich, canWrite }: { reloadKey: 
       if (filters.type) q.type = filters.type;
       if (filters.source) q.source = filters.source;
       if (filters.fresh) q.maxAgeDays = 90;
+      if (filters.minConf) q.minConfidence = filters.minConf;
       const p = await api.indicators(q);
       setItems(p.items); setTotal(p.total);
     } catch { /* offline */ } finally { setLoading(false); }
@@ -1119,6 +1167,12 @@ function IndicatorGrid({ reloadKey, sources, onEnrich, canWrite }: { reloadKey: 
         >
           <Activity size={14} /> Fresh (90d)
         </button>
+        <select className="page-size" value={filters.minConf} onChange={(e) => setFilter("minConf", Number(e.target.value))} title="Suppress low-confidence noise" aria-label="Min confidence">
+          <option value={0}>Any confidence</option>
+          <option value={25}>Conf ≥ 25</option>
+          <option value={50}>Conf ≥ 50</option>
+          <option value={75}>Conf ≥ 75</option>
+        </select>
         <SavedSearchBar
           kind="ioc"
           current={{ filters, sort }}
@@ -1578,7 +1632,8 @@ function EnrichModal({ target, onClose, canWrite }: { target: { value: string; t
     return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
   }, [onClose]);
 
-  const hasAny = data && (data.shodan || data.greynoise || data.abuseipdb);
+  const hasAny = data && (data.shodan || data.greynoise || data.abuseipdb || data.pulsedive);
+  const isIp = target.type === "ip" || /^\d{1,3}(\.\d{1,3}){3}$/.test(ipForLinks);
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -1586,12 +1641,14 @@ function EnrichModal({ target, onClose, canWrite }: { target: { value: string; t
         <div className="modal-head">
           <div className="modal-title ioc-value">{target.value}</div>
           <div className="spacer" />
-          <a className="chip" href={`https://www.virustotal.com/gui/search/${encodeURIComponent(ipForLinks)}`} target="_blank" rel="noopener noreferrer">
+          <a className="chip" href={`https://www.virustotal.com/gui/search/${encodeURIComponent(target.value)}`} target="_blank" rel="noopener noreferrer">
             <ExternalLink size={14} /> VirusTotal
           </a>
-          <a className="chip" href={`https://www.shodan.io/host/${encodeURIComponent(ipForLinks)}`} target="_blank" rel="noopener noreferrer">
-            <ExternalLink size={14} /> Shodan
-          </a>
+          {isIp && (
+            <a className="chip" href={`https://www.shodan.io/host/${encodeURIComponent(ipForLinks)}`} target="_blank" rel="noopener noreferrer">
+              <ExternalLink size={14} /> Shodan
+            </a>
+          )}
           <FeedbackButtons refKey={`ioc:${target.value}`} canWrite={canWrite} />
           <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
         </div>
@@ -1624,6 +1681,15 @@ function EnrichModal({ target, onClose, canWrite }: { target: { value: string; t
                   <EnrichRow label="Reports" val={String(data.abuseipdb.reports)} />
                   <EnrichRow label="Country" val={data.abuseipdb.countryCode ?? "—"} />
                   {data.abuseipdb.isp && <EnrichRow label="ISP" val={data.abuseipdb.isp} />}
+                </div>
+              )}
+              {data.pulsedive && (
+                <div className="panel enrich-card">
+                  <div className="ov-card-title">Pulsedive {data.pulsedive.iid && <a className="chip" href={`https://pulsedive.com/indicator/?iid=${data.pulsedive.iid}`} target="_blank" rel="noopener noreferrer"><ExternalLink size={12} /></a>}</div>
+                  <EnrichRow label="Risk" val={data.pulsedive.risk} crit={["high", "critical"].includes(data.pulsedive.risk)} />
+                  <EnrichRow label="Threats" val={data.pulsedive.threats.map((t) => t.name).join(", ") || "—"} />
+                  <EnrichRow label="Feeds" val={data.pulsedive.feeds.slice(0, 5).join(", ") || "—"} />
+                  <EnrichRow label="Last seen" val={data.pulsedive.lastSeen ?? "—"} />
                 </div>
               )}
               {!hasAny && (
@@ -1955,12 +2021,14 @@ function AuditPanel({ onClose }: { onClose: () => void }) {
 function ExposureView({ reloadKey, canWrite }: { reloadKey: number; canWrite: boolean }) {
   const [breaches, setBreaches] = useState<Breach[]>([]);
   const [typo, setTypo] = useState<TyposquatGroup[]>([]);
+  const [mentions, setMentions] = useState<import("./api.ts").MentionGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const load = useCallback(() => {
     setLoading(true);
     api.breaches().then(setBreaches).catch(() => setBreaches([])).finally(() => setLoading(false));
     api.typosquat().then(setTypo).catch(() => setTypo([]));
+    api.mentions().then(setMentions).catch(() => setMentions([]));
   }, []);
   useEffect(() => { load(); }, [load, reloadKey]);
 
@@ -2016,6 +2084,26 @@ function ExposureView({ reloadKey, canWrite }: { reloadKey: number; canWrite: bo
               {g.candidates.slice(0, 24).map((c) => <span className="chip mono dim" key={c}>{c}</span>)}
             </div>
           </div>
+        </div>
+      ))}
+
+      <div className="grid-toolbar" style={{ marginTop: 18 }}>
+        <div className="toolbar-title"><ScanSearch size={16} /> Brand mentions <span className="muted">(in your intel)</span></div>
+      </div>
+      {mentions.length === 0 && <div className="empty">No mentions of your My Stack terms in ingested advisories or indicators.</div>}
+      {mentions.map((m) => (
+        <div className="typo-group" key={m.term}>
+          <div className="ov-card-title">{m.term} <span className="muted">· {m.advisories.length} advisory · {m.indicators.length} IOC</span></div>
+          {m.advisories.slice(0, 5).map((a) => (
+            <div className="ov-secondary" key={a.url || a.title}>
+              <a href={a.url} target="_blank" rel="noopener noreferrer">{a.title}</a> <span className="muted">· {a.source}{a.published ? ` · ${formatDate(a.published)}` : ""}</span>
+            </div>
+          ))}
+          {m.indicators.length > 0 && (
+            <div className="actor-chips" style={{ marginTop: 4 }}>
+              {m.indicators.slice(0, 12).map((i) => <span className="chip mono" key={i.value} title={i.source}>{defang(i.value)}</span>)}
+            </div>
+          )}
         </div>
       ))}
     </section>
@@ -2262,12 +2350,250 @@ function SourcesPanel({ onClose, onChange }: { onClose: () => void; onChange: ()
                 <div className="ov-secondary muted">{s.signalType} · {s.kind} · <span className={`badge rel-${s.reliability}`}>{s.reliability}</span></div>
               </div>
               <div className="spacer" />
+              <input
+                className="note-input src-sector"
+                placeholder="sector…"
+                defaultValue={s.sector ?? ""}
+                title="Relevance sector tag"
+                onBlur={(e) => { const v = e.target.value.trim(); if (v !== (s.sector ?? "")) api.setSourceSector(s.id, v || null).then(load).catch(() => {}); }}
+              />
               <div className="src-dates">
                 <div className="src-date muted">{s.createdAt ? `added ${formatDate(s.createdAt)}` : ""}</div>
                 {s.lastRunAt && <div className="src-date muted">last run {formatDate(s.lastRunAt)}</div>}
               </div>
               <button className="icon-btn" data-tooltip="Run now" aria-label="Run now" disabled={busy === s.id} onClick={() => run(s)}><Play size={16} className={busy === s.id ? "spin" : ""} /></button>
               <button className="icon-btn danger" data-tooltip="Delete feed" aria-label="Delete feed" onClick={() => remove(s)}><Trash2 size={16} /></button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ATT&CK coverage matrix
+
+function MatrixModal({ onClose }: { onClose: () => void }) {
+  const [cols, setCols] = useState<import("./api.ts").AttackMatrixColumn[]>([]);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => { api.attackMatrix().then(setCols).catch(() => setCols([])).finally(() => setLoading(false)); }, []);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow; document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
+  const shown = cols.filter((c) => c.techniques.length > 0);
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title"><Grid3x3 size={16} /> ATT&amp;CK coverage matrix</div>
+          <div className="spacer" />
+          <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body" style={{ padding: 16 }}>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>Techniques referenced across your ingested intel, grouped by tactic. Chip number = times referenced.</div>
+          {loading && <div className="empty">Loading…</div>}
+          {!loading && shown.length === 0 && <div className="empty">No ATT&CK/ATLAS techniques referenced in current intel.</div>}
+          <div className="matrix">
+            {shown.map((c) => (
+              <div className="matrix-col" key={c.tactic}>
+                <div className="matrix-head">{c.name} <span className="muted">({c.techniques.length})</span></div>
+                {c.techniques.map((t) => (
+                  <a className="matrix-tech" key={t.id} href={techniqueUrl(t.id)} target="_blank" rel="noopener noreferrer">
+                    {t.id} <span className="muted">×{t.count}</span>
+                  </a>
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Entity resolution: same CVE across sources
+
+function EntitiesModal({ onClose }: { onClose: () => void }) {
+  const [items, setItems] = useState<import("./api.ts").CveEntity[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [multiOnly, setMultiOnly] = useState(false);
+  useEffect(() => { api.entities().then(setItems).catch(() => setItems([])).finally(() => setLoading(false)); }, []);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow; document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
+  const view = multiOnly ? items.filter((e) => e.sources.length > 1) : items;
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title"><Layers size={16} /> Entity resolution</div>
+          <div className="spacer" />
+          <button className={`chip ${multiOnly ? "on" : ""}`} onClick={() => setMultiOnly((v) => !v)}>Multi-source only</button>
+          <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body" style={{ padding: 16 }}>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>The same CVE reported by multiple feeds, merged — with each source and its reliability grade.</div>
+          {loading && <div className="empty">Loading…</div>}
+          {!loading && view.length === 0 && <div className="empty">No entities.</div>}
+          {view.map((e) => (
+            <div className="ov-row" key={e.cveId}>
+              <span className={`badge ${riskBand(e.riskScore)}`}>{e.riskScore}</span>
+              <div className="ov-row-text">
+                <div className="ov-primary">
+                  <a href={`https://nvd.nist.gov/vuln/detail/${e.cveId}`} target="_blank" rel="noopener noreferrer">{e.cveId}</a>
+                  {e.knownExploited && <span className="flag"> EXPLOITED</span>}
+                  <span className="badge rel-A" style={{ marginLeft: 6 }}>{e.sources.length} source{e.sources.length === 1 ? "" : "s"}</span>
+                </div>
+                <div className="ov-secondary muted">{e.title}</div>
+                <div className="actor-chips" style={{ marginTop: 4 }}>
+                  {e.sources.map((s) => <span className="chip" key={s.source}>{s.source} <span className={`badge rel-${s.reliability}`}>{s.reliability}</span></span>)}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Detection-rule library + gap analysis
+
+function DetectionPanel({ onClose, canWrite }: { onClose: () => void; canWrite: boolean }) {
+  const [rules, setRules] = useState<import("./api.ts").DetectionRule[]>([]);
+  const [gaps, setGaps] = useState<import("./api.ts").DetectionGaps | null>(null);
+  const [name, setName] = useState("");
+  const [format, setFormat] = useState<"sigma" | "yara" | "snort" | "other">("sigma");
+  const [techniques, setTechniques] = useState("");
+  const [content, setContent] = useState("");
+  const load = useCallback(() => {
+    api.detectionRules().then(setRules).catch(() => {});
+    api.detectionGaps().then(setGaps).catch(() => setGaps(null));
+  }, []);
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow; document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
+  async function add(e: FormEvent) {
+    e.preventDefault();
+    if (!name.trim()) return;
+    const techs = techniques.split(/[,\s]+/).map((t) => t.trim().toUpperCase()).filter(Boolean);
+    try { await api.createDetectionRule({ name: name.trim(), format, techniques: techs, content, enabled: true }); setName(""); setTechniques(""); setContent(""); load(); } catch { /* ignore */ }
+  }
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title"><ShieldCheck size={16} /> Detection rule library</div>
+          <div className="spacer" />
+          <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body" style={{ padding: 16 }}>
+          {gaps && (
+            <div className="ai-summary" style={{ marginTop: 0 }}>
+              <div className="ov-card-title">Coverage gaps</div>
+              <div className="muted" style={{ fontSize: 12 }}>{gaps.ruleCount} rule(s) · {gaps.gaps.length} technique(s) in intel with no covering rule:</div>
+              <div className="actor-chips" style={{ marginTop: 6 }}>
+                {gaps.gaps.slice(0, 30).map((t) => <a className="chip" key={t.id} href={techniqueUrl(t.id)} target="_blank" rel="noopener noreferrer">{t.id} ×{t.count}</a>)}
+                {gaps.gaps.length === 0 && <span className="muted">No gaps — every referenced technique is covered.</span>}
+              </div>
+            </div>
+          )}
+          {canWrite && (
+            <form onSubmit={add} className="rule-form" style={{ marginTop: 12 }}>
+              <input className="note-input" placeholder="Rule name" value={name} onChange={(e) => setName(e.target.value)} />
+              <select className="page-size" value={format} onChange={(e) => setFormat(e.target.value as typeof format)}>
+                <option value="sigma">sigma</option><option value="yara">yara</option><option value="snort">snort</option><option value="other">other</option>
+              </select>
+              <input className="note-input" placeholder="ATT&CK IDs (T1059, T1486…)" value={techniques} onChange={(e) => setTechniques(e.target.value)} />
+              <button className="btn-primary" type="submit"><Plus size={16} /> Add</button>
+            </form>
+          )}
+          {canWrite && <textarea className="note-input" placeholder="Rule content (optional)" rows={2} value={content} onChange={(e) => setContent(e.target.value)} style={{ width: "100%", marginBottom: 10 }} />}
+          {rules.length === 0 && <div className="empty">No rules yet.</div>}
+          {rules.map((r) => (
+            <div className="ov-row" key={r.id}>
+              <span className="badge rel-B">{r.format}</span>
+              <div className="ov-row-text">
+                <div className="ov-primary">{r.name}</div>
+                <div className="actor-chips" style={{ marginTop: 2 }}>{r.techniques.map((t) => <span className="chip" key={t}>{t}</span>)}</div>
+              </div>
+              <div className="spacer" />
+              {canWrite && <button className="icon-btn danger" data-tooltip="Delete" aria-label="Delete rule" onClick={() => api.deleteDetectionRule(r.id).then(load).catch(() => {})}><Trash2 size={16} /></button>}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// RFI tracker
+
+function RfiPanel({ onClose, canWrite }: { onClose: () => void; canWrite: boolean }) {
+  const [rfis, setRfis] = useState<import("./api.ts").Rfi[]>([]);
+  const [question, setQuestion] = useState("");
+  const [context, setContext] = useState("");
+  const load = useCallback(() => { api.rfis().then(setRfis).catch(() => {}); }, []);
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow; document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
+  async function add(e: FormEvent) {
+    e.preventDefault();
+    if (!question.trim()) return;
+    try { await api.createRfi(question.trim(), context.trim()); setQuestion(""); setContext(""); load(); } catch { /* ignore */ }
+  }
+  async function answer(r: import("./api.ts").Rfi) {
+    const a = window.prompt("Answer:", r.answer);
+    if (a == null) return;
+    try { await api.updateRfi(r.id, { answer: a, status: a.trim() ? "answered" : r.status }); load(); } catch { /* ignore */ }
+  }
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title"><HelpCircle size={16} /> RFI tracker <span className="muted">({rfis.length})</span></div>
+          <div className="spacer" />
+          <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body" style={{ padding: 16 }}>
+          {canWrite && (
+            <form onSubmit={add} className="ask-form" style={{ flexWrap: "wrap" }}>
+              <input className="note-input" placeholder="Request / question…" value={question} onChange={(e) => setQuestion(e.target.value)} />
+              <input className="note-input" placeholder="Context (optional)" value={context} onChange={(e) => setContext(e.target.value)} />
+              <button className="btn-primary" type="submit"><Plus size={16} /> Raise</button>
+            </form>
+          )}
+          {rfis.length === 0 && <div className="empty">No RFIs yet.</div>}
+          {rfis.map((r) => (
+            <div className="ov-row" key={r.id}>
+              <span className={`badge ${r.status === "open" ? "crit" : r.status === "answered" ? "rel-B" : "rel-C"}`}>{r.status}</span>
+              <div className="ov-row-text">
+                <div className="ov-primary">{r.question}</div>
+                {r.context && <div className="ov-secondary muted">{r.context}</div>}
+                {r.answer && <div className="ov-secondary">↳ {r.answer}</div>}
+              </div>
+              <div className="spacer" />
+              {canWrite && <button className="icon-btn" data-tooltip="Answer" aria-label="Answer" onClick={() => answer(r)}><FileText size={15} /></button>}
+              {canWrite && r.status !== "closed" && <button className="icon-btn" data-tooltip="Close RFI" aria-label="Close RFI" onClick={() => api.updateRfi(r.id, { status: "closed" }).then(load).catch(() => {})}><X size={15} /></button>}
+              {canWrite && <button className="icon-btn danger" data-tooltip="Delete" aria-label="Delete RFI" onClick={() => api.deleteRfi(r.id).then(load).catch(() => {})}><Trash2 size={15} /></button>}
             </div>
           ))}
         </div>
@@ -2320,6 +2646,7 @@ function AddFeed({ onAdded }: { onAdded: () => void }) {
   const [feedKind, setFeedKind] = useState<"json" | "taxii">("json");
   const [taxiiUser, setTaxiiUser] = useState("");
   const [taxiiSecret, setTaxiiSecret] = useState("");
+  const [sector, setSector] = useState("");
   const [msg, setMsg] = useState("");
 
   async function submit(e: FormEvent) {
@@ -2330,22 +2657,23 @@ function AddFeed({ onAdded }: { onAdded: () => void }) {
     const taxiiConfig: Record<string, string> = taxiiUser
       ? { username: taxiiUser, password: taxiiSecret }
       : taxiiSecret ? { token: taxiiSecret } : {};
+    const sec = sector.trim() || null;
     const body: NewSource = feedKind === "taxii"
       ? {
           name, kind: "taxii", signalType: "indicator", url,
           schedule: "0 */6 * * *", enabled: true, requiresAuth: Boolean(taxiiSecret),
-          config: taxiiConfig,
+          sector: sec, config: taxiiConfig,
         }
       : {
           name, kind: "json", signalType: "vulnerability", url,
           schedule: "0 */6 * * *", enabled: true, requiresAuth: false,
-          config: { itemsPath, map: {} },
+          sector: sec, config: { itemsPath, map: {} },
         };
     try {
       const created = await api.addSource(body);
       await api.runSource(created.id);
       setMsg(`Added "${created.name}" and triggered first fetch.`);
-      setName(""); setUrl(""); setItemsPath(""); setTaxiiUser(""); setTaxiiSecret("");
+      setName(""); setUrl(""); setItemsPath(""); setTaxiiUser(""); setTaxiiSecret(""); setSector("");
       onAdded();
     } catch (err) {
       setMsg(`Error: ${(err as Error).message}`);
@@ -2366,6 +2694,10 @@ function AddFeed({ onAdded }: { onAdded: () => void }) {
         <div className="field">
           <label>Feed name</label>
           <input value={name} onChange={(e) => setName(e.target.value)} placeholder={feedKind === "taxii" ? "My TAXII collection" : "My CVE feed"} required />
+        </div>
+        <div className="field">
+          <label>Sector (optional)</label>
+          <input value={sector} onChange={(e) => setSector(e.target.value)} placeholder="e.g. finance, healthcare" />
         </div>
         <div className="field">
           <label>{feedKind === "taxii" ? "Collection objects URL" : "JSON URL"}</label>

@@ -24,7 +24,7 @@ export {
   fetchEpss, parseEpss, fetchNvdCvss, extractCvss, cvssFromMetrics, sleep,
   fetchGeo, parseGeo, type EpssResult, type GeoResult,
 } from "./enrichers.js";
-export { enrichIoc, parseShodan, parseGreynoise, parseAbuse, type IocEnrichment } from "./enrich-ioc.js";
+export { enrichIoc, parseShodan, parseGreynoise, parseAbuse, parsePulsedive, type IocEnrichment } from "./enrich-ioc.js";
 export { parseSbom, parsePurl, queryOsvBatch, type SbomComponent, type SbomResult } from "./sbom.js";
 export { fetchBreaches, fetchBreachesForDomain } from "./hibp.js";
 

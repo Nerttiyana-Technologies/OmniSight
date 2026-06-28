@@ -6,6 +6,7 @@ import {
   NewSourceSchema, SourceSchema, IndicatorSchema, type Source, type Indicator,
   vulnerabilitiesToCsv, indicatorsToCsv, indicatorsToStix, indicatorsToBlocklist, indicatorsToSigma,
   indicatorsToYara, indicatorsToSnort, parseStixIndicators, typosquatVariants,
+  ATTACK_TACTICS, tacticForTechnique,
 } from "@omnisight/shared";
 import { createRepository, composeDigest } from "@omnisight/db";
 import { roleAtLeast, type Role } from "@omnisight/shared";
@@ -306,6 +307,85 @@ app.post("/api/breaches/run", async (_req, reply) => {
   }
 });
 
+// --- Brand mentions (paste/dark-web-style cross-ref over ingested intel) ---
+app.get("/api/mentions", async () => {
+  const terms = await repo.listWatchlist();
+  const out: { term: string; advisories: { title: string; url: string; source: string; published: string | null }[]; indicators: { value: string; source: string; malware: string | null }[] }[] = [];
+  for (const term of terms) {
+    const [adv, ioc] = await Promise.all([
+      repo.pageAdvisories({ q: term, limit: 25 }),
+      repo.pageIndicators({ q: term, pageSize: 25 }),
+    ]);
+    if (adv.items.length === 0 && ioc.items.length === 0) continue;
+    out.push({
+      term,
+      advisories: adv.items.map((a) => ({ title: a.title, url: a.url, source: a.source, published: a.published })),
+      indicators: ioc.items.map((i) => ({ value: i.value, source: i.source, malware: i.malware })),
+    });
+  }
+  return out;
+});
+
+// --- Detection-rule library + gap analysis ---
+app.get("/api/detection-rules", async () => repo.listDetectionRules());
+app.post("/api/detection-rules", async (req, reply) => {
+  const b = (req.body ?? {}) as Partial<import("@omnisight/db").DetectionRule>;
+  if (!b.name?.trim()) return reply.status(400).send({ error: "name required" });
+  if (!["sigma", "yara", "snort", "other"].includes(b.format ?? "")) return reply.status(400).send({ error: "invalid format" });
+  return repo.createDetectionRule({
+    name: b.name.trim(), format: b.format as "sigma" | "yara" | "snort" | "other",
+    content: b.content ?? "", techniques: (b.techniques ?? []).map((t) => String(t).toUpperCase()), enabled: b.enabled ?? true,
+  });
+});
+app.patch("/api/detection-rules/:id", async (req) => {
+  await repo.updateDetectionRule((req.params as { id: string }).id, (req.body ?? {}) as Partial<import("@omnisight/db").DetectionRule>);
+  return { ok: true };
+});
+app.delete("/api/detection-rules/:id", async (req) => {
+  await repo.deleteDetectionRule((req.params as { id: string }).id);
+  return { ok: true };
+});
+/** Techniques referenced in intel that no enabled rule covers. */
+app.get("/api/detection-gaps", async () => {
+  const [techniques, rules] = await Promise.all([repo.attackTechniques(200), repo.listDetectionRules()]);
+  const covered = new Set<string>();
+  for (const r of rules) if (r.enabled) for (const t of r.techniques) covered.add(t.toUpperCase());
+  const gaps = techniques.filter((t) => !covered.has(t.id.toUpperCase()));
+  return { covered: [...covered], gaps, ruleCount: rules.length };
+});
+
+// --- ATT&CK coverage matrix (tactic-grouped) ---
+app.get("/api/attack/matrix", async () => {
+  const techniques = await repo.attackTechniques(300);
+  const byTactic = new Map<string, { id: string; count: number }[]>();
+  for (const t of techniques) {
+    const tactic = tacticForTechnique(t.id);
+    const arr = byTactic.get(tactic) ?? [];
+    arr.push({ id: t.id, count: t.count });
+    byTactic.set(tactic, arr);
+  }
+  return ATTACK_TACTICS.map((tac) => ({ tactic: tac.id, name: tac.name, techniques: byTactic.get(tac.id) ?? [] }));
+});
+
+// --- Entity resolution: same CVE across sources ---
+app.get("/api/entities", async () => repo.cveEntities(150));
+
+// --- RFI workflow ---
+app.get("/api/rfis", async () => repo.listRfis());
+app.post("/api/rfis", async (req, reply) => {
+  const b = (req.body ?? {}) as { question?: string; context?: string };
+  if (!b.question?.trim()) return reply.status(400).send({ error: "question required" });
+  return repo.createRfi(b.question.trim(), b.context ?? "");
+});
+app.patch("/api/rfis/:id", async (req) => {
+  await repo.updateRfi((req.params as { id: string }).id, (req.body ?? {}) as Record<string, never>);
+  return { ok: true };
+});
+app.delete("/api/rfis/:id", async (req) => {
+  await repo.deleteRfi((req.params as { id: string }).id);
+  return { ok: true };
+});
+
 // --- Analyst feedback / verdicts ---
 app.get("/api/feedback", async () => repo.getFeedback());
 app.post("/api/feedback", async (req, reply) => {
@@ -480,6 +560,7 @@ app.get("/api/enrich/ioc", async (req, reply) => {
   return enrichIoc(q.value, q.type ?? "ip", {
     greynoiseKey: process.env.GREYNOISE_API_KEY?.trim() || undefined,
     abuseKey: process.env.ABUSEIPDB_API_KEY?.trim() || undefined,
+    pulsediveKey: process.env.PULSEDIVE_API_KEY?.trim() || undefined,
   });
 });
 
@@ -602,6 +683,7 @@ app.get("/api/indicators", async (req) => {
     source: q.source || undefined,
     sort: q.sort || undefined,
     maxAgeDays: q.maxAgeDays ? Number(q.maxAgeDays) : undefined,
+    minConfidence: q.minConfidence ? Number(q.minConfidence) : undefined,
     dir: q.dir === "asc" ? "asc" : q.dir === "desc" ? "desc" : undefined,
   });
   return { ...result, page, pageSize };
@@ -676,9 +758,17 @@ app.post("/api/sources", async (req, reply) => {
 
 /** Admin: enable/disable a source (takes effect on the worker's next schedule cycle). */
 app.patch("/api/sources/:id", async (req, reply) => {
-  const { enabled } = (req.body ?? {}) as { enabled?: boolean };
-  if (typeof enabled !== "boolean") return reply.status(400).send({ error: "enabled (boolean) required" });
-  await repo.setSourceEnabled((req.params as { id: string }).id, enabled);
+  const body = (req.body ?? {}) as { enabled?: boolean; sector?: string | null };
+  const id = (req.params as { id: string }).id;
+  if (typeof body.enabled === "boolean") await repo.setSourceEnabled(id, body.enabled);
+  if ("sector" in body) {
+    const src = (await repo.listSources()).find((s) => s.id === id);
+    if (!src) return reply.status(404).send({ error: "source not found" });
+    await repo.upsertSource({ ...src, sector: body.sector?.trim() || null });
+  }
+  if (typeof body.enabled !== "boolean" && !("sector" in body)) {
+    return reply.status(400).send({ error: "enabled (boolean) or sector (string) required" });
+  }
   return { ok: true };
 });
 
