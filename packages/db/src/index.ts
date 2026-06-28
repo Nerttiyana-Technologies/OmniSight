@@ -47,6 +47,7 @@ export interface IndicatorListOptions {
   q?: string;
   source?: string;
   maxAgeDays?: number; // "fresh only": drop indicators last seen older than this
+  minConfidence?: number; // noise control: drop indicators below this confidence
   sort?: string; // confidence | lastseen | type | malware | value | source
   dir?: "asc" | "desc";
 }
@@ -135,6 +136,37 @@ export interface AuditEntry {
 }
 
 export type Verdict = "confirmed" | "false_positive";
+
+/** An editable detection rule in the library, tagged to ATT&CK techniques. */
+export interface DetectionRule {
+  id: string;
+  name: string;
+  format: "sigma" | "yara" | "snort" | "other";
+  content: string;
+  techniques: string[];
+  enabled: boolean;
+  createdAt: string;
+}
+
+/** A request-for-information ticket. */
+export interface Rfi {
+  id: string;
+  question: string;
+  context: string;
+  status: "open" | "answered" | "closed";
+  answer: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** One CVE resolved across all the sources that reported it. */
+export interface CveEntity {
+  cveId: string;
+  title: string;
+  riskScore: number;
+  knownExploited: boolean;
+  sources: { source: string; reliability: string }[];
+}
 
 /** A saved, named filter set for the vuln or IOC grid. */
 export interface SavedSearch {
@@ -323,6 +355,16 @@ export interface Repository {
   listSavedSearches(): Promise<SavedSearch[]>;
   createSavedSearch(s: Omit<SavedSearch, "id" | "createdAt">): Promise<SavedSearch>;
   deleteSavedSearch(id: string): Promise<void>;
+  listDetectionRules(): Promise<DetectionRule[]>;
+  createDetectionRule(r: Omit<DetectionRule, "id" | "createdAt">): Promise<DetectionRule>;
+  updateDetectionRule(id: string, patch: Partial<Omit<DetectionRule, "id" | "createdAt">>): Promise<void>;
+  deleteDetectionRule(id: string): Promise<void>;
+  listRfis(): Promise<Rfi[]>;
+  createRfi(question: string, context: string): Promise<Rfi>;
+  updateRfi(id: string, patch: Partial<Pick<Rfi, "status" | "answer" | "question" | "context">>): Promise<void>;
+  deleteRfi(id: string): Promise<void>;
+  /** Same CVE grouped across the sources that reported it. */
+  cveEntities(limit?: number): Promise<CveEntity[]>;
   stats(): Promise<Stats>;
   /** Distinct CVE ids, optionally only those missing a given enrichment field. */
   distinctCveIds(missing?: "cvss" | "epss", limit?: number): Promise<string[]>;
@@ -626,6 +668,7 @@ export class InMemoryRepository implements Repository {
       const cutoff = Date.now() - opts.maxAgeDays * 86400000;
       rows = rows.filter((i) => !i.lastSeen || new Date(i.lastSeen).getTime() >= cutoff);
     }
+    if (opts.minConfidence) rows = rows.filter((i) => (i.confidence ?? 0) >= opts.minConfidence!);
     const dir = opts.dir === "asc" ? 1 : -1;
     const val = (i: Indicator): string | number | null => {
       switch (opts.sort) {
@@ -797,6 +840,60 @@ export class InMemoryRepository implements Repository {
   }
   async deleteSavedSearch(id: string): Promise<void> {
     this.savedSearches.delete(id);
+  }
+
+  private detRules = new Map<string, DetectionRule>();
+  async listDetectionRules(): Promise<DetectionRule[]> {
+    return [...this.detRules.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+  async createDetectionRule(r: Omit<DetectionRule, "id" | "createdAt">): Promise<DetectionRule> {
+    const rec: DetectionRule = { ...r, id: newId(), createdAt: new Date().toISOString() };
+    this.detRules.set(rec.id, rec);
+    return rec;
+  }
+  async updateDetectionRule(id: string, patch: Partial<Omit<DetectionRule, "id" | "createdAt">>): Promise<void> {
+    const r = this.detRules.get(id);
+    if (r) this.detRules.set(id, { ...r, ...patch });
+  }
+  async deleteDetectionRule(id: string): Promise<void> {
+    this.detRules.delete(id);
+  }
+
+  private rfis = new Map<string, Rfi>();
+  async listRfis(): Promise<Rfi[]> {
+    return [...this.rfis.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+  async createRfi(question: string, context: string): Promise<Rfi> {
+    const now = new Date().toISOString();
+    const rec: Rfi = { id: newId(), question, context, status: "open", answer: "", createdAt: now, updatedAt: now };
+    this.rfis.set(rec.id, rec);
+    return rec;
+  }
+  async updateRfi(id: string, patch: Partial<Pick<Rfi, "status" | "answer" | "question" | "context">>): Promise<void> {
+    const r = this.rfis.get(id);
+    if (r) this.rfis.set(id, { ...r, ...patch, updatedAt: new Date().toISOString() });
+  }
+  async deleteRfi(id: string): Promise<void> {
+    this.rfis.delete(id);
+  }
+
+  async cveEntities(limit = 100): Promise<CveEntity[]> {
+    const byCve = new Map<string, CveEntity>();
+    for (const v of this.vulns.values()) {
+      const cve = v.cveId ?? v.id;
+      const rel = this.sources.get(v.source)?.reliability ?? "C";
+      const cur = byCve.get(cve);
+      if (cur) {
+        cur.riskScore = Math.max(cur.riskScore, v.riskScore);
+        cur.knownExploited = cur.knownExploited || v.knownExploited;
+        if (!cur.sources.some((s) => s.source === v.source)) cur.sources.push({ source: v.source, reliability: rel });
+      } else {
+        byCve.set(cve, { cveId: cve, title: v.title, riskScore: v.riskScore, knownExploited: v.knownExploited, sources: [{ source: v.source, reliability: rel }] });
+      }
+    }
+    return [...byCve.values()]
+      .sort((a, b) => b.sources.length - a.sources.length || b.riskScore - a.riskScore)
+      .slice(0, limit);
   }
 
   async stats(): Promise<Stats> {
@@ -998,13 +1095,14 @@ export class PostgresRepository implements Repository {
 
   async upsertSource(s: Source): Promise<void> {
     await this.pool.query(
-      `INSERT INTO sources (id,name,kind,signal_type,url,schedule,enabled,requires_auth,reliability,config)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      `INSERT INTO sources (id,name,kind,signal_type,url,schedule,enabled,requires_auth,reliability,sector,config)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        ON CONFLICT (id) DO UPDATE SET
          name=EXCLUDED.name, kind=EXCLUDED.kind, signal_type=EXCLUDED.signal_type,
          url=EXCLUDED.url, schedule=EXCLUDED.schedule, enabled=EXCLUDED.enabled,
-         requires_auth=EXCLUDED.requires_auth, reliability=EXCLUDED.reliability, config=EXCLUDED.config`,
-      [s.id, s.name, s.kind, s.signalType, s.url, s.schedule, s.enabled, s.requiresAuth, s.reliability, s.config],
+         requires_auth=EXCLUDED.requires_auth, reliability=EXCLUDED.reliability,
+         sector=EXCLUDED.sector, config=EXCLUDED.config`,
+      [s.id, s.name, s.kind, s.signalType, s.url, s.schedule, s.enabled, s.requiresAuth, s.reliability, s.sector ?? null, s.config],
     );
   }
 
@@ -1020,6 +1118,7 @@ export class PostgresRepository implements Repository {
       enabled: r.enabled,
       requiresAuth: r.requires_auth,
       reliability: (r.reliability as Source["reliability"]) ?? "C",
+      sector: (r.sector as string) ?? null,
       config: r.config,
       createdAt: r.created_at ? new Date(r.created_at as string).toISOString() : null,
       lastRunAt: r.last_run_at ? new Date(r.last_run_at as string).toISOString() : null,
@@ -1075,6 +1174,105 @@ export class PostgresRepository implements Repository {
   }
   async deleteSavedSearch(id: string): Promise<void> {
     await this.pool.query(`DELETE FROM saved_searches WHERE id = $1`, [id]);
+  }
+
+  private rowToDetRule(r: Record<string, unknown>): DetectionRule {
+    return {
+      id: r.id as string,
+      name: r.name as string,
+      format: r.format as DetectionRule["format"],
+      content: (r.content as string) ?? "",
+      techniques: (r.techniques as string[]) ?? [],
+      enabled: Boolean(r.enabled),
+      createdAt: new Date(r.created_at as string).toISOString(),
+    };
+  }
+  async listDetectionRules(): Promise<DetectionRule[]> {
+    const { rows } = await this.pool.query(`SELECT * FROM detection_rules ORDER BY name`);
+    return rows.map((r) => this.rowToDetRule(r));
+  }
+  async createDetectionRule(r: Omit<DetectionRule, "id" | "createdAt">): Promise<DetectionRule> {
+    const { rows } = await this.pool.query(
+      `INSERT INTO detection_rules (id,name,format,content,techniques,enabled) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [newId(), r.name, r.format, r.content, JSON.stringify(r.techniques ?? []), r.enabled],
+    );
+    return this.rowToDetRule(rows[0]);
+  }
+  async updateDetectionRule(id: string, patch: Partial<Omit<DetectionRule, "id" | "createdAt">>): Promise<void> {
+    const sets: string[] = []; const params: unknown[] = [];
+    const col: Record<string, string> = { name: "name", format: "format", content: "content", techniques: "techniques", enabled: "enabled" };
+    for (const [k, v] of Object.entries(patch)) {
+      const c = col[k]; if (!c) continue;
+      params.push(k === "techniques" ? JSON.stringify(v) : v);
+      sets.push(`${c} = $${params.length}`);
+    }
+    if (!sets.length) return;
+    params.push(id);
+    await this.pool.query(`UPDATE detection_rules SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+  }
+  async deleteDetectionRule(id: string): Promise<void> {
+    await this.pool.query(`DELETE FROM detection_rules WHERE id = $1`, [id]);
+  }
+
+  private rowToRfi(r: Record<string, unknown>): Rfi {
+    return {
+      id: r.id as string,
+      question: r.question as string,
+      context: (r.context as string) ?? "",
+      status: r.status as Rfi["status"],
+      answer: (r.answer as string) ?? "",
+      createdAt: new Date(r.created_at as string).toISOString(),
+      updatedAt: new Date(r.updated_at as string).toISOString(),
+    };
+  }
+  async listRfis(): Promise<Rfi[]> {
+    const { rows } = await this.pool.query(`SELECT * FROM rfis ORDER BY created_at DESC`);
+    return rows.map((r) => this.rowToRfi(r));
+  }
+  async createRfi(question: string, context: string): Promise<Rfi> {
+    const { rows } = await this.pool.query(
+      `INSERT INTO rfis (id,question,context) VALUES ($1,$2,$3) RETURNING *`,
+      [newId(), question, context],
+    );
+    return this.rowToRfi(rows[0]);
+  }
+  async updateRfi(id: string, patch: Partial<Pick<Rfi, "status" | "answer" | "question" | "context">>): Promise<void> {
+    const sets: string[] = []; const params: unknown[] = [];
+    const col: Record<string, string> = { status: "status", answer: "answer", question: "question", context: "context" };
+    for (const [k, v] of Object.entries(patch)) {
+      const c = col[k]; if (!c) continue;
+      params.push(v); sets.push(`${c} = $${params.length}`);
+    }
+    if (!sets.length) return;
+    sets.push(`updated_at = now()`);
+    params.push(id);
+    await this.pool.query(`UPDATE rfis SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+  }
+  async deleteRfi(id: string): Promise<void> {
+    await this.pool.query(`DELETE FROM rfis WHERE id = $1`, [id]);
+  }
+
+  async cveEntities(limit = 100): Promise<CveEntity[]> {
+    const { rows } = await this.pool.query(
+      `SELECT COALESCE(v.cve_id, v.id) AS cve,
+              MAX(v.title) AS title,
+              MAX(v.risk_score) AS risk,
+              BOOL_OR(v.known_exploited) AS exploited,
+              JSON_AGG(JSON_BUILD_OBJECT('source', v.source, 'reliability', COALESCE(s.reliability,'C'))) AS sources,
+              COUNT(DISTINCT v.source) AS n
+         FROM vulnerabilities v LEFT JOIN sources s ON s.id = v.source
+         GROUP BY COALESCE(v.cve_id, v.id)
+         ORDER BY n DESC, risk DESC
+         LIMIT $1`,
+      [Math.min(limit, 500)],
+    );
+    return rows.map((r) => ({
+      cveId: r.cve as string,
+      title: (r.title as string) ?? "",
+      riskScore: Number(r.risk ?? 0),
+      knownExploited: Boolean(r.exploited),
+      sources: (r.sources as { source: string; reliability: string }[]) ?? [],
+    }));
   }
 
   async upsertVulnerabilities(items: Vulnerability[]): Promise<number> {
@@ -1240,6 +1438,10 @@ export class PostgresRepository implements Repository {
     if (opts.maxAgeDays) {
       params.push(opts.maxAgeDays);
       where.push(`(last_seen IS NULL OR last_seen >= now() - ($${params.length} || ' days')::interval)`);
+    }
+    if (opts.minConfidence) {
+      params.push(opts.minConfidence);
+      where.push(`COALESCE(confidence, 0) >= $${params.length}`);
     }
     const clause = where.length ? "WHERE " + where.join(" AND ") : "";
     const countRes = await this.pool.query(`SELECT COUNT(*)::int AS total FROM indicators ${clause}`, params);

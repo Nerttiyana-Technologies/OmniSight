@@ -447,9 +447,43 @@ th.sortable:hover { color: var(--accent); }
 .icon-btn.fb-off { color: var(--critical); border-color: var(--critical); }
 .icon-btn.danger:hover { color: var(--critical); border-color: var(--critical); background: transparent; }
 
-/* Manage-feeds date column */
+/* Manage-feeds date column + sector input */
 .src-dates { text-align: right; white-space: nowrap; margin-right: 6px; }
 .src-date { font-size: 12px; }
+.src-sector { width: 110px; flex: none; font-size: 12px; padding: 5px 8px; margin-right: 8px; }
+
+/* Content links (entities, mentions, etc.) — use the theme accent, not raw blue */
+.ov-row-text a, .ov-primary a, .ov-secondary a { color: var(--accent); text-decoration: none; }
+.ov-row-text a:hover, .ov-primary a:hover, .ov-secondary a:hover { text-decoration: underline; }
+
+/* Feedback verdict badge in grid rows */
+.fb-badge { display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 4px; font-size: 10px; font-weight: 700; vertical-align: middle; }
+.fb-badge.confirmed { background: var(--low); color: #08130d; }
+.fb-badge.false_positive { background: var(--critical); color: #fff; }
+
+/* ATT&CK matrix */
+.modal-wide { max-width: 1100px; width: 94vw; }
+.matrix { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 8px; }
+.matrix-col { flex: 0 0 150px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 8px; }
+.matrix-head { font-size: 12px; font-weight: 600; margin-bottom: 6px; min-height: 30px; }
+.matrix-tech { display: block; font-size: 11px; font-family: ui-monospace, Menlo, monospace; padding: 3px 5px; margin-bottom: 3px;
+  border-radius: 4px; background: var(--bg-elev-2); color: var(--text); text-decoration: none; }
+.matrix-tech:hover { border: 1px solid var(--accent); }
+
+/* Mobile-responsive read view */
+@media (max-width: 720px) {
+  .topbar { flex-wrap: wrap; gap: 6px; padding: 8px 10px; }
+  .topbar .brand small { display: none; }
+  .stat-grid { grid-template-columns: repeat(2, 1fr) !important; }
+  .tabs { overflow-x: auto; white-space: nowrap; }
+  main { padding: 10px; }
+  table { font-size: 12px; }
+  .modal { width: 96vw; max-width: 96vw; }
+  .modal-wide { width: 96vw; }
+  .grid-toolbar { flex-wrap: wrap; }
+  .live-status .muted { display: none; }
+  .actor-grid { grid-template-columns: 1fr; }
+}
 
 /* Typosquat / look-alike groups */
 .typo-group { padding: 10px 0; border-bottom: 1px solid var(--border); }

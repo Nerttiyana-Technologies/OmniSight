@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS indicators (
 
 -- Self-migration: add reliability to sources created before it existed.
 ALTER TABLE sources ADD COLUMN IF NOT EXISTS reliability TEXT NOT NULL DEFAULT 'C';
+-- Self-migration: optional relevance sector tag on sources.
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS sector TEXT;
 
 -- Self-migration: add geo columns to indicators tables created before they existed.
 ALTER TABLE indicators ADD COLUMN IF NOT EXISTS country      TEXT;
@@ -128,6 +130,28 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   role          TEXT NOT NULL DEFAULT 'viewer' CHECK (role IN ('viewer','analyst','admin')),
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Detection-rule library: editable Sigma/YARA/Snort rules tagged to ATT&CK.
+CREATE TABLE IF NOT EXISTS detection_rules (
+  id         TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  format     TEXT NOT NULL CHECK (format IN ('sigma','yara','snort','other')),
+  content    TEXT NOT NULL DEFAULT '',
+  techniques JSONB NOT NULL DEFAULT '[]',
+  enabled    BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- RFI (request-for-information) tracker.
+CREATE TABLE IF NOT EXISTS rfis (
+  id         TEXT PRIMARY KEY,
+  question   TEXT NOT NULL,
+  context    TEXT NOT NULL DEFAULT '',
+  status     TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','answered','closed')),
+  answer     TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Analyst feedback: a verdict on a CVE or IOC ref ("cve:..."/"ioc:...").
