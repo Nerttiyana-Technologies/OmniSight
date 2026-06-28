@@ -3,7 +3,7 @@ import {
   Radar, Moon, Sun, RefreshCw, Plus, ShieldAlert, Skull, Flame, Database, TrendingUp, Rss,
   Activity, Gauge, ChevronLeft, ChevronRight, Crosshair, Server, X, Download, FileText, Newspaper, ExternalLink,
   ScanSearch, Copy, Package, LogOut, Users as UsersIcon, Lock, Trash2, Sparkles, ScrollText, Bug, KeyRound,
-  Workflow, Link2, ShieldOff,
+  Workflow, Link2, ShieldOff, Bookmark, ThumbsUp, ThumbsDown, Globe, Power, Play,
 } from "lucide-react";
 import {
   riskBand, threatLevel, extractIocs, defang, roleAtLeast, type Vulnerability, type Indicator, type Advisory, type NewSource, type Source,
@@ -12,6 +12,7 @@ import {
 import {
   api, setToken, type Stats, type VulnQuery, type IndicatorQuery, type AdvisoryQuery, type MapPoint, type MapIndicator,
   type Correlation, type AttackTechnique, type ActorProfile, type AuditEntry, type Breach, type Rule, type AiLink,
+  type SavedSearch, type Verdict, type TyposquatGroup,
 } from "./api.ts";
 import { makeProjector, topologyToGeometries, geomToPath, type Geom } from "./geo.ts";
 
@@ -108,6 +109,7 @@ export function App() {
 
   // Automation rules (admin)
   const [showRules, setShowRules] = useState(false);
+  const [showSources, setShowSources] = useState(false);
 
   const REFRESH_MS = 15000;
   const bump = useCallback(() => setReloadKey((k) => k + 1), []);
@@ -201,6 +203,11 @@ export function App() {
         {isAdmin && (
           <button className="icon-btn" data-tooltip="Automation rules" aria-label="Automation rules" onClick={() => setShowRules(true)}>
             <Workflow size={18} />
+          </button>
+        )}
+        {isAdmin && (
+          <button className="icon-btn" data-tooltip="Manage feeds" aria-label="Manage feeds" onClick={() => setShowSources(true)}>
+            <Database size={18} />
           </button>
         )}
         {isAdmin && authEnabled && (
@@ -346,6 +353,7 @@ export function App() {
         {showUsers && <UsersPanel onClose={() => setShowUsers(false)} meId={me?.id ?? null} />}
         {showAudit && <AuditPanel onClose={() => setShowAudit(false)} />}
         {showRules && <RulesPanel onClose={() => setShowRules(false)} />}
+        {showSources && <SourcesPanel onClose={() => setShowSources(false)} onChange={bump} />}
         {showAsk && <AskAiModal onClose={() => setShowAsk(false)} onDetail={onDetail} />}
         {showCorrelate && <CorrelateModal onClose={() => setShowCorrelate(false)} />}
         {showExtract && <ExtractModal onClose={() => setShowExtract(false)} onEnrich={onEnrich} />}
@@ -943,6 +951,16 @@ function VulnGrid({ reloadKey, sources, terms, onDetail }: { reloadKey: number; 
         </button>
         {terms.length === 0 && <span className="muted">Add software via the My Stack panel to filter by what you run.</span>}
         <div className="spacer" />
+        <SavedSearchBar
+          kind="vuln"
+          current={{ filters, sort }}
+          onApply={(p) => {
+            const pp = p as { filters?: Partial<VulnFilters>; sort?: { field: string; dir: "asc" | "desc" } };
+            if (pp.filters) setFilters({ ...EMPTY_VULN_FILTERS, ...pp.filters });
+            if (pp.sort) setSort(pp.sort);
+            setPage(1);
+          }}
+        />
         <button className="chip" onClick={() => download(api.exportVulnUrl(exportParams()))} title="Download current view as CSV">
           <Download size={14} /> Export CSV
         </button>
@@ -1101,6 +1119,16 @@ function IndicatorGrid({ reloadKey, sources, onEnrich, canWrite }: { reloadKey: 
         >
           <Activity size={14} /> Fresh (90d)
         </button>
+        <SavedSearchBar
+          kind="ioc"
+          current={{ filters, sort }}
+          onApply={(p) => {
+            const pp = p as { filters?: Partial<IocFilters>; sort?: { field: string; dir: "asc" | "desc" } };
+            if (pp.filters) setFilters({ ...EMPTY_IOC_FILTERS, ...pp.filters });
+            if (pp.sort) setSort(pp.sort);
+            setPage(1);
+          }}
+        />
         <div className="spacer" />
         <span className="muted">Export:</span>
         <button className="chip" onClick={() => download(api.exportIndicatorUrl(exportParams(), "csv"))} title="Download as CSV">
@@ -1477,6 +1505,7 @@ function VulnDetailModal({ v, onClose, canWrite, aiEnabled }: { v: Vulnerability
               <Sparkles size={16} className={summarizing ? "pulse" : ""} />
             </button>
           )}
+          <FeedbackButtons refKey={`cve:${cve}`} canWrite={canWrite} />
           <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
         </div>
         <div className="modal-body" style={{ padding: 18 }}>
@@ -1563,6 +1592,7 @@ function EnrichModal({ target, onClose, canWrite }: { target: { value: string; t
           <a className="chip" href={`https://www.shodan.io/host/${encodeURIComponent(ipForLinks)}`} target="_blank" rel="noopener noreferrer">
             <ExternalLink size={14} /> Shodan
           </a>
+          <FeedbackButtons refKey={`ioc:${target.value}`} canWrite={canWrite} />
           <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
         </div>
         <div className="modal-body" style={{ padding: 16 }}>
@@ -1924,11 +1954,13 @@ function AuditPanel({ onClose }: { onClose: () => void }) {
 
 function ExposureView({ reloadKey, canWrite }: { reloadKey: number; canWrite: boolean }) {
   const [breaches, setBreaches] = useState<Breach[]>([]);
+  const [typo, setTypo] = useState<TyposquatGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const load = useCallback(() => {
     setLoading(true);
     api.breaches().then(setBreaches).catch(() => setBreaches([])).finally(() => setLoading(false));
+    api.typosquat().then(setTypo).catch(() => setTypo([]));
   }, []);
   useEffect(() => { load(); }, [load, reloadKey]);
 
@@ -1959,6 +1991,30 @@ function ExposureView({ reloadKey, canWrite }: { reloadKey: number; canWrite: bo
           <div className="ov-row-text">
             <div className="ov-primary">{b.title} <span className="muted">· {b.domain}</span> {b.breachDate && <span className="muted">· {b.breachDate}</span>}</div>
             <div className="ov-secondary muted">{b.dataClasses.slice(0, 6).join(", ")}{b.dataClasses.length > 6 ? "…" : ""}</div>
+          </div>
+        </div>
+      ))}
+
+      <div className="grid-toolbar" style={{ marginTop: 18 }}>
+        <div className="toolbar-title"><Globe size={16} /> Look-alike domains</div>
+      </div>
+      {typo.length === 0 && <div className="empty">Add domain-style terms (e.g. <code>yourbrand.com</code>) to My Stack to monitor for typosquats.</div>}
+      {typo.map((g) => (
+        <div className="typo-group" key={g.brand}>
+          <div className="ov-card-title">{g.brand}</div>
+          {g.seen.length > 0 && (
+            <div className="typo-block">
+              <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>Seen in your intel ({g.seen.length}):</div>
+              <div className="actor-chips">
+                {g.seen.map((s) => <span className="chip mono" key={s.value} title={`${s.source}${s.malware ? " · " + s.malware : ""}`}>{defang(s.value)}</span>)}
+              </div>
+            </div>
+          )}
+          <div className="typo-block">
+            <div className="muted" style={{ fontSize: 12, margin: "6px 0 4px" }}>Permutations to watch:</div>
+            <div className="actor-chips">
+              {g.candidates.slice(0, 24).map((c) => <span className="chip mono dim" key={c}>{c}</span>)}
+            </div>
           </div>
         </div>
       ))}
@@ -2092,6 +2148,126 @@ function RulesPanel({ onClose }: { onClose: () => void }) {
                 </div>
               </div>
               <button className="icon-btn note-del" data-tooltip="Delete" aria-label="Delete rule" onClick={() => api.deleteRule(r.id).then(load).catch(() => {})}><Trash2 size={14} /></button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Saved-search control for a grid toolbar: apply / save / delete named views.
+function SavedSearchBar({ kind, current, onApply }: { kind: "vuln" | "ioc"; current: Record<string, unknown>; onApply: (params: Record<string, unknown>) => void }) {
+  const [list, setList] = useState<SavedSearch[]>([]);
+  const [sel, setSel] = useState("");
+  const load = useCallback(() => { api.searches().then((s) => setList(s.filter((x) => x.kind === kind))).catch(() => {}); }, [kind]);
+  useEffect(() => { load(); }, [load]);
+  async function save() {
+    const name = window.prompt("Name this saved search:");
+    if (!name?.trim()) return;
+    try { await api.createSearch(name.trim(), kind, current); load(); } catch { /* ignore */ }
+  }
+  function apply(id: string) {
+    setSel(id);
+    const s = list.find((x) => x.id === id);
+    if (s) onApply(s.params);
+  }
+  async function del() {
+    if (!sel) return;
+    try { await api.deleteSearch(sel); setSel(""); load(); } catch { /* ignore */ }
+  }
+  return (
+    <>
+      <select className="page-size" value={sel} onChange={(e) => apply(e.target.value)} aria-label="Saved searches" title="Apply a saved search">
+        <option value="">Saved…</option>
+        {list.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+      </select>
+      <button className="icon-btn" data-tooltip="Save current view" aria-label="Save search" onClick={save}><Bookmark size={16} /></button>
+      {sel && <button className="icon-btn note-del" data-tooltip="Delete saved search" aria-label="Delete saved search" onClick={del}><Trash2 size={14} /></button>}
+    </>
+  );
+}
+
+// Analyst verdict (confirmed / false-positive) for a CVE or IOC ref.
+function FeedbackButtons({ refKey, canWrite }: { refKey: string; canWrite: boolean }) {
+  const [verdict, setVerdict] = useState<Verdict | null>(null);
+  useEffect(() => {
+    api.feedback().then((m) => setVerdict(m[refKey] ?? null)).catch(() => {});
+  }, [refKey]);
+  async function set(v: Verdict) {
+    const next = verdict === v ? null : v;
+    setVerdict(next);
+    try { await api.setFeedback(refKey, next); } catch { /* ignore */ }
+  }
+  if (!canWrite) {
+    return verdict ? <span className={`badge ${verdict === "confirmed" ? "crit" : "rel-C"}`}>{verdict === "confirmed" ? "confirmed" : "false positive"}</span> : null;
+  }
+  return (
+    <>
+      <button className={`icon-btn ${verdict === "confirmed" ? "fb-on" : ""}`} data-tooltip="Confirmed threat" aria-label="Mark confirmed" onClick={() => set("confirmed")}><ThumbsUp size={16} /></button>
+      <button className={`icon-btn ${verdict === "false_positive" ? "fb-off" : ""}`} data-tooltip="False positive" aria-label="Mark false positive" onClick={() => set("false_positive")}><ThumbsDown size={16} /></button>
+    </>
+  );
+}
+
+// Admin: manage feeds — enable/disable, run now, delete.
+function SourcesPanel({ onClose, onChange }: { onClose: () => void; onChange: () => void }) {
+  const [sources, setSources] = useState<Source[]>([]);
+  const [busy, setBusy] = useState("");
+  const [err, setErr] = useState("");
+  const load = useCallback(() => { api.sources().then(setSources).catch(() => {}); }, []);
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
+
+  async function toggle(s: Source) {
+    setErr("");
+    try { await api.setSourceEnabled(s.id, !s.enabled); } catch (e) { setErr(`Toggle failed: ${(e as Error).message}`); }
+    load();
+  }
+  async function run(s: Source) {
+    setBusy(s.id); setErr("");
+    try { await api.runSource(s.id); onChange(); } catch (e) { setErr(`Run failed: ${(e as Error).message}`); } finally { setBusy(""); }
+  }
+  async function remove(s: Source) {
+    if (!window.confirm(`Delete "${s.name}" and all its ingested data? This cannot be undone.`)) return;
+    setErr("");
+    try { await api.deleteSource(s.id); } catch (e) { setErr(`Delete failed: ${(e as Error).message}`); }
+    load(); onChange();
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title"><Database size={16} /> Manage feeds <span className="muted">({sources.length})</span></div>
+          <div className="spacer" />
+          <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body" style={{ padding: 16 }}>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>Enable/disable, run, or delete feeds. Schedule changes apply on the worker's next cycle; deleting a feed removes its ingested rows.</div>
+          {err && <div className="login-error">{err}</div>}
+          {sources.map((s) => (
+            <div className="ov-row src-row" key={s.id}>
+              <button className={`icon-btn ${s.enabled ? "fb-on" : ""}`} data-tooltip={s.enabled ? "Disable" : "Enable"} aria-label="Toggle" onClick={() => toggle(s)}>
+                <Power size={16} />
+              </button>
+              <div className="ov-row-text">
+                <div className="ov-primary">{s.name} {!s.enabled && <span className="muted">(disabled)</span>}</div>
+                <div className="ov-secondary muted">{s.signalType} · {s.kind} · <span className={`badge rel-${s.reliability}`}>{s.reliability}</span></div>
+              </div>
+              <div className="spacer" />
+              <div className="src-dates">
+                <div className="src-date muted">{s.createdAt ? `added ${formatDate(s.createdAt)}` : ""}</div>
+                {s.lastRunAt && <div className="src-date muted">last run {formatDate(s.lastRunAt)}</div>}
+              </div>
+              <button className="icon-btn" data-tooltip="Run now" aria-label="Run now" disabled={busy === s.id} onClick={() => run(s)}><Play size={16} className={busy === s.id ? "spin" : ""} /></button>
+              <button className="icon-btn danger" data-tooltip="Delete feed" aria-label="Delete feed" onClick={() => remove(s)}><Trash2 size={16} /></button>
             </div>
           ))}
         </div>

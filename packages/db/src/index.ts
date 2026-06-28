@@ -134,6 +134,17 @@ export interface AuditEntry {
   status: number | null;
 }
 
+export type Verdict = "confirmed" | "false_positive";
+
+/** A saved, named filter set for the vuln or IOC grid. */
+export interface SavedSearch {
+  id: string;
+  name: string;
+  kind: "vuln" | "ioc";
+  params: Record<string, unknown>;
+  createdAt: string;
+}
+
 export type RuleAction = "webhook" | "email" | "jira";
 
 /** A user-defined automation rule: when a vuln matches, run an action. */
@@ -301,6 +312,17 @@ export interface Repository {
   pendingRuleCandidates(floorRisk: number): Promise<Vulnerability[]>;
   upsertSource(source: Source): Promise<void>;
   listSources(): Promise<Source[]>;
+  /** Enable/disable a source. */
+  setSourceEnabled(id: string, enabled: boolean): Promise<void>;
+  /** Delete a source and (via cascade) its ingested rows. */
+  deleteSource(id: string): Promise<void>;
+  /** Set an analyst verdict (confirmed / false_positive) on a CVE or IOC ref. */
+  setFeedback(ref: string, verdict: Verdict | null): Promise<void>;
+  /** Verdicts keyed by ref, for the given refs (or all when omitted). */
+  getFeedback(refs?: string[]): Promise<Record<string, Verdict>>;
+  listSavedSearches(): Promise<SavedSearch[]>;
+  createSavedSearch(s: Omit<SavedSearch, "id" | "createdAt">): Promise<SavedSearch>;
+  deleteSavedSearch(id: string): Promise<void>;
   stats(): Promise<Stats>;
   /** Distinct CVE ids, optionally only those missing a given enrichment field. */
   distinctCveIds(missing?: "cvss" | "epss", limit?: number): Promise<string[]>;
@@ -733,11 +755,48 @@ export class InMemoryRepository implements Repository {
   }
 
   async upsertSource(source: Source): Promise<void> {
-    this.sources.set(source.id, source);
+    const existing = this.sources.get(source.id);
+    this.sources.set(source.id, { ...source, createdAt: source.createdAt ?? existing?.createdAt ?? new Date().toISOString() });
   }
 
   async listSources(): Promise<Source[]> {
     return [...this.sources.values()];
+  }
+
+  async setSourceEnabled(id: string, enabled: boolean): Promise<void> {
+    const s = this.sources.get(id);
+    if (s) s.enabled = enabled;
+  }
+  async deleteSource(id: string): Promise<void> {
+    this.sources.delete(id);
+    for (const [k, v] of this.vulns) if (v.source === id) this.vulns.delete(k);
+    for (const [k, i] of this.indicators) if (i.source === id) this.indicators.delete(k);
+    for (const [k, a] of this.advisories) if (a.source === id) this.advisories.delete(k);
+  }
+
+  private feedback = new Map<string, Verdict>();
+  async setFeedback(ref: string, verdict: Verdict | null): Promise<void> {
+    if (verdict) this.feedback.set(ref, verdict);
+    else this.feedback.delete(ref);
+  }
+  async getFeedback(refs?: string[]): Promise<Record<string, Verdict>> {
+    const out: Record<string, Verdict> = {};
+    if (refs) { for (const r of refs) { const v = this.feedback.get(r); if (v) out[r] = v; } }
+    else for (const [k, v] of this.feedback) out[k] = v;
+    return out;
+  }
+
+  private savedSearches = new Map<string, SavedSearch>();
+  async listSavedSearches(): Promise<SavedSearch[]> {
+    return [...this.savedSearches.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+  async createSavedSearch(s: Omit<SavedSearch, "id" | "createdAt">): Promise<SavedSearch> {
+    const rec: SavedSearch = { ...s, id: newId(), createdAt: new Date().toISOString() };
+    this.savedSearches.set(rec.id, rec);
+    return rec;
+  }
+  async deleteSavedSearch(id: string): Promise<void> {
+    this.savedSearches.delete(id);
   }
 
   async stats(): Promise<Stats> {
@@ -962,7 +1021,60 @@ export class PostgresRepository implements Repository {
       requiresAuth: r.requires_auth,
       reliability: (r.reliability as Source["reliability"]) ?? "C",
       config: r.config,
+      createdAt: r.created_at ? new Date(r.created_at as string).toISOString() : null,
+      lastRunAt: r.last_run_at ? new Date(r.last_run_at as string).toISOString() : null,
     }));
+  }
+
+  async setSourceEnabled(id: string, enabled: boolean): Promise<void> {
+    await this.pool.query(`UPDATE sources SET enabled = $1 WHERE id = $2`, [enabled, id]);
+  }
+  async deleteSource(id: string): Promise<void> {
+    // FK ON DELETE CASCADE removes this source's vulns/indicators/advisories.
+    await this.pool.query(`DELETE FROM sources WHERE id = $1`, [id]);
+  }
+
+  async setFeedback(ref: string, verdict: Verdict | null): Promise<void> {
+    if (verdict) {
+      await this.pool.query(
+        `INSERT INTO feedback (ref, verdict) VALUES ($1,$2)
+           ON CONFLICT (ref) DO UPDATE SET verdict = EXCLUDED.verdict, created_at = now()`,
+        [ref, verdict],
+      );
+    } else {
+      await this.pool.query(`DELETE FROM feedback WHERE ref = $1`, [ref]);
+    }
+  }
+  async getFeedback(refs?: string[]): Promise<Record<string, Verdict>> {
+    const { rows } = refs && refs.length
+      ? await this.pool.query(`SELECT ref, verdict FROM feedback WHERE ref = ANY($1)`, [refs])
+      : await this.pool.query(`SELECT ref, verdict FROM feedback`);
+    const out: Record<string, Verdict> = {};
+    for (const r of rows) out[r.ref as string] = r.verdict as Verdict;
+    return out;
+  }
+
+  async listSavedSearches(): Promise<SavedSearch[]> {
+    const { rows } = await this.pool.query(`SELECT * FROM saved_searches ORDER BY name`);
+    return rows.map((r) => ({
+      id: r.id as string,
+      name: r.name as string,
+      kind: r.kind as "vuln" | "ioc",
+      params: (r.params as Record<string, unknown>) ?? {},
+      createdAt: new Date(r.created_at as string).toISOString(),
+    }));
+  }
+  async createSavedSearch(s: Omit<SavedSearch, "id" | "createdAt">): Promise<SavedSearch> {
+    const id = newId();
+    const { rows } = await this.pool.query(
+      `INSERT INTO saved_searches (id,name,kind,params) VALUES ($1,$2,$3,$4) RETURNING *`,
+      [id, s.name, s.kind, JSON.stringify(s.params ?? {})],
+    );
+    const r = rows[0];
+    return { id: r.id, name: r.name, kind: r.kind, params: r.params ?? {}, createdAt: new Date(r.created_at).toISOString() };
+  }
+  async deleteSavedSearch(id: string): Promise<void> {
+    await this.pool.query(`DELETE FROM saved_searches WHERE id = $1`, [id]);
   }
 
   async upsertVulnerabilities(items: Vulnerability[]): Promise<number> {

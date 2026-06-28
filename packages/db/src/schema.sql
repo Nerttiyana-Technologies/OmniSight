@@ -130,6 +130,22 @@ CREATE TABLE IF NOT EXISTS users (
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Analyst feedback: a verdict on a CVE or IOC ref ("cve:..."/"ioc:...").
+CREATE TABLE IF NOT EXISTS feedback (
+  ref        TEXT PRIMARY KEY,
+  verdict    TEXT NOT NULL CHECK (verdict IN ('confirmed','false_positive')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Saved searches: named filter sets for the vuln/IOC grids.
+CREATE TABLE IF NOT EXISTS saved_searches (
+  id         TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  kind       TEXT NOT NULL CHECK (kind IN ('vuln','ioc')),
+  params     JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- Automation rules: when a vuln matches the trigger, run the action.
 CREATE TABLE IF NOT EXISTS rules (
   id             TEXT PRIMARY KEY,

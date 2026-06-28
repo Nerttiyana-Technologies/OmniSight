@@ -442,6 +442,21 @@ th.sortable:hover { color: var(--accent); }
 /* Audit log rows */
 .audit-row .ov-primary { font-size: 13px; }
 
+/* Feedback verdict buttons */
+.icon-btn.fb-on { color: var(--low); border-color: var(--low); }
+.icon-btn.fb-off { color: var(--critical); border-color: var(--critical); }
+.icon-btn.danger:hover { color: var(--critical); border-color: var(--critical); background: transparent; }
+
+/* Manage-feeds date column */
+.src-dates { text-align: right; white-space: nowrap; margin-right: 6px; }
+.src-date { font-size: 12px; }
+
+/* Typosquat / look-alike groups */
+.typo-group { padding: 10px 0; border-bottom: 1px solid var(--border); }
+.typo-group:last-child { border-bottom: none; }
+.typo-block { margin: 4px 0; }
+.chip.dim { opacity: 0.7; }
+
 /* Breach exposure rows */
 .breach-row .badge { min-width: 52px; text-align: center; }
 
