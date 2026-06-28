@@ -130,6 +130,34 @@ CREATE TABLE IF NOT EXISTS users (
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Automation rules: when a vuln matches the trigger, run the action.
+CREATE TABLE IF NOT EXISTS rules (
+  id             TEXT PRIMARY KEY,
+  name           TEXT NOT NULL,
+  enabled        BOOLEAN NOT NULL DEFAULT TRUE,
+  min_risk       INTEGER NOT NULL DEFAULT 75,
+  exploited_only BOOLEAN NOT NULL DEFAULT FALSE,
+  stack_only     BOOLEAN NOT NULL DEFAULT TRUE,
+  action         TEXT NOT NULL CHECK (action IN ('webhook','email','jira')),
+  config         JSONB NOT NULL DEFAULT '{}',
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Breach / leaked-credential exposure for monitored domains (Have I Been Pwned).
+CREATE TABLE IF NOT EXISTS breaches (
+  id           TEXT PRIMARY KEY,
+  domain       TEXT NOT NULL,
+  title        TEXT NOT NULL,
+  breach_date  DATE,
+  added_date   TIMESTAMPTZ,
+  pwn_count    BIGINT NOT NULL DEFAULT 0,
+  data_classes JSONB NOT NULL DEFAULT '[]',
+  description  TEXT NOT NULL DEFAULT '',
+  verified     BOOLEAN NOT NULL DEFAULT FALSE,
+  fetched_at   TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_breaches_domain ON breaches (domain);
+
 -- Audit trail: who did what (mutating actions), for security/compliance review.
 CREATE TABLE IF NOT EXISTS audit_log (
   id         TEXT PRIMARY KEY,

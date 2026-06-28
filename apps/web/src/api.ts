@@ -146,6 +146,39 @@ export interface AiVulnResult {
   total: number;
 }
 
+export interface Breach {
+  id: string;
+  domain: string;
+  title: string;
+  breachDate: string | null;
+  addedDate: string | null;
+  pwnCount: number;
+  dataClasses: string[];
+  description: string;
+  verified: boolean;
+  fetchedAt: string;
+}
+
+export interface Rule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  minRisk: number;
+  exploitedOnly: boolean;
+  stackOnly: boolean;
+  action: "webhook" | "email" | "jira";
+  config: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface AiLink {
+  cve: string;
+  ioc: string;
+  malware: string | null;
+  confidence: string;
+  rationale: string;
+}
+
 export interface IocEnrichment {
   value: string;
   type: string;
@@ -156,7 +189,16 @@ export interface IocEnrichment {
 }
 
 async function json<T>(res: Response): Promise<T> {
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) {
+    // Surface the server's error message (e.g. the underlying TAXII/HIBP failure)
+    // instead of a bare status code.
+    let detail = "";
+    try {
+      const body = await res.clone().json() as { error?: string };
+      if (body?.error) detail = `: ${body.error}`;
+    } catch { /* non-JSON body */ }
+    throw new Error(`HTTP ${res.status}${detail}`);
+  }
   return res.json() as Promise<T>;
 }
 
@@ -227,6 +269,15 @@ export const api = {
   actors: () => af("/api/actors").then(json<ActorProfile[]>),
   actor: (name: string) => af(`/api/actors/${encodeURIComponent(name)}`).then(json<ActorProfile>),
   audit: () => af("/api/audit").then(json<AuditEntry[]>),
+  aiCorrelate: () => af("/api/ai/correlate", { method: "POST" }).then(json<{ links: AiLink[] }>),
+  breaches: () => af("/api/breaches").then(json<Breach[]>),
+  runBreaches: () => af("/api/breaches/run", { method: "POST" }).then(json<{ ingested: number }>),
+  rules: () => af("/api/rules").then(json<Rule[]>),
+  createRule: (body: Partial<Rule>) =>
+    af("/api/rules", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).then(json<Rule>),
+  updateRule: (id: string, patch: Partial<Rule>) =>
+    af(`/api/rules/${id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(patch) }).then(json<{ ok: boolean }>),
+  deleteRule: (id: string) => af(`/api/rules/${id}`, { method: "DELETE" }).then(json<{ ok: boolean }>),
   stats: () => af("/api/stats").then(json<Stats>),
   map: () => af("/api/map").then(json<MapPoint[]>),
   correlations: () => af("/api/correlations").then(json<Correlation[]>),

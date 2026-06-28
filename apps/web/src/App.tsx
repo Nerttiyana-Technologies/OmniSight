@@ -3,6 +3,7 @@ import {
   Radar, Moon, Sun, RefreshCw, Plus, ShieldAlert, Skull, Flame, Database, TrendingUp, Rss,
   Activity, Gauge, ChevronLeft, ChevronRight, Crosshair, Server, X, Download, FileText, Newspaper, ExternalLink,
   ScanSearch, Copy, Package, LogOut, Users as UsersIcon, Lock, Trash2, Sparkles, ScrollText, Bug, KeyRound,
+  Workflow, Link2, ShieldOff,
 } from "lucide-react";
 import {
   riskBand, threatLevel, extractIocs, defang, roleAtLeast, type Vulnerability, type Indicator, type Advisory, type NewSource, type Source,
@@ -10,12 +11,12 @@ import {
 } from "@omnisight/shared";
 import {
   api, setToken, type Stats, type VulnQuery, type IndicatorQuery, type AdvisoryQuery, type MapPoint, type MapIndicator,
-  type Correlation, type AttackTechnique, type ActorProfile, type AuditEntry,
+  type Correlation, type AttackTechnique, type ActorProfile, type AuditEntry, type Breach, type Rule, type AiLink,
 } from "./api.ts";
 import { makeProjector, topologyToGeometries, geomToPath, type Geom } from "./geo.ts";
 
 type Theme = "dark" | "light";
-type Tab = "overview" | "vulns" | "iocs" | "actors" | "news" | "map";
+type Tab = "overview" | "vulns" | "iocs" | "actors" | "exposure" | "news" | "map";
 
 function toneBadgeClass(tone?: DigestTone): string {
   return tone && tone !== "info" ? tone : "info";
@@ -103,6 +104,10 @@ export function App() {
   // AI
   const [aiEnabled, setAiEnabled] = useState(false);
   const [showAsk, setShowAsk] = useState(false);
+  const [showCorrelate, setShowCorrelate] = useState(false);
+
+  // Automation rules (admin)
+  const [showRules, setShowRules] = useState(false);
 
   const REFRESH_MS = 15000;
   const bump = useCallback(() => setReloadKey((k) => k + 1), []);
@@ -186,6 +191,16 @@ export function App() {
         {aiEnabled && (
           <button className="icon-btn" data-tooltip="Ask AI" aria-label="Ask AI" onClick={() => setShowAsk(true)}>
             <Sparkles size={18} />
+          </button>
+        )}
+        {aiEnabled && (
+          <button className="icon-btn" data-tooltip="AI correlation suggestions" aria-label="AI correlations" onClick={() => setShowCorrelate(true)}>
+            <Link2 size={18} />
+          </button>
+        )}
+        {isAdmin && (
+          <button className="icon-btn" data-tooltip="Automation rules" aria-label="Automation rules" onClick={() => setShowRules(true)}>
+            <Workflow size={18} />
           </button>
         )}
         {isAdmin && authEnabled && (
@@ -308,6 +323,9 @@ export function App() {
           <button className={`tab ${tab === "actors" ? "active" : ""}`} onClick={() => setTab("actors")}>
             Actors
           </button>
+          <button className={`tab ${tab === "exposure" ? "active" : ""}`} onClick={() => setTab("exposure")}>
+            Exposure
+          </button>
           <button className={`tab ${tab === "news" ? "active" : ""}`} onClick={() => setTab("news")}>
             News {stats && <span className="muted">({stats.advisories.toLocaleString()})</span>}
           </button>
@@ -320,13 +338,16 @@ export function App() {
         {tab === "vulns" && <VulnGrid reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "vulnerability")} terms={terms} onDetail={onDetail} />}
         {tab === "iocs" && <IndicatorGrid reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "indicator")} onEnrich={onEnrich} canWrite={canWrite} />}
         {tab === "actors" && <ActorsView reloadKey={reloadKey} onEnrich={onEnrich} />}
+        {tab === "exposure" && <ExposureView reloadKey={reloadKey} canWrite={canWrite} />}
         {tab === "news" && <NewsView reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "advisory")} />}
         {tab === "map" && <MapView reloadKey={reloadKey} onEnrich={onEnrich} />}
         {enrichTarget && <EnrichModal target={enrichTarget} onClose={() => setEnrichTarget(null)} canWrite={canWrite} />}
         {detailTarget && <VulnDetailModal v={detailTarget} onClose={() => setDetailTarget(null)} canWrite={canWrite} aiEnabled={aiEnabled} />}
         {showUsers && <UsersPanel onClose={() => setShowUsers(false)} meId={me?.id ?? null} />}
         {showAudit && <AuditPanel onClose={() => setShowAudit(false)} />}
+        {showRules && <RulesPanel onClose={() => setShowRules(false)} />}
         {showAsk && <AskAiModal onClose={() => setShowAsk(false)} onDetail={onDetail} />}
+        {showCorrelate && <CorrelateModal onClose={() => setShowCorrelate(false)} />}
         {showExtract && <ExtractModal onClose={() => setShowExtract(false)} onEnrich={onEnrich} />}
         {showSbom && <SbomModal onClose={() => setShowSbom(false)} />}
       </main>
@@ -1898,6 +1919,187 @@ function AuditPanel({ onClose }: { onClose: () => void }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Breach exposure (Have I Been Pwned)
+
+function ExposureView({ reloadKey, canWrite }: { reloadKey: number; canWrite: boolean }) {
+  const [breaches, setBreaches] = useState<Breach[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [running, setRunning] = useState(false);
+  const load = useCallback(() => {
+    setLoading(true);
+    api.breaches().then(setBreaches).catch(() => setBreaches([])).finally(() => setLoading(false));
+  }, []);
+  useEffect(() => { load(); }, [load, reloadKey]);
+
+  async function run() {
+    setRunning(true);
+    try { await api.runBreaches(); load(); } catch { /* not configured */ }
+    finally { setRunning(false); }
+  }
+
+  return (
+    <section className="panel">
+      <div className="grid-toolbar">
+        <div className="toolbar-title"><ShieldOff size={16} /> Breach exposure <span className="muted">({breaches.length})</span></div>
+        <div className="spacer" />
+        {canWrite && (
+          <button className="icon-btn" data-tooltip="Check now (HIBP)" aria-label="Check breaches" disabled={running} onClick={run}>
+            <RefreshCw size={18} className={running ? "spin" : ""} />
+          </button>
+        )}
+      </div>
+      {loading && <div className="empty">Loading…</div>}
+      {!loading && breaches.length === 0 && (
+        <div className="empty">No breach data. Set <code>HIBP_DOMAINS</code> (comma-separated) in <code>.env</code>, then check now — OmniSight lists known breaches at your domains via Have I Been Pwned.</div>
+      )}
+      {breaches.map((b) => (
+        <div className="ov-row breach-row" key={b.id}>
+          <span className={`badge ${b.verified ? "crit" : "rel-C"}`}>{b.pwnCount ? `${(b.pwnCount / 1e6).toFixed(b.pwnCount >= 1e6 ? 1 : 3)}M` : "—"}</span>
+          <div className="ov-row-text">
+            <div className="ov-primary">{b.title} <span className="muted">· {b.domain}</span> {b.breachDate && <span className="muted">· {b.breachDate}</span>}</div>
+            <div className="ov-secondary muted">{b.dataClasses.slice(0, 6).join(", ")}{b.dataClasses.length > 6 ? "…" : ""}</div>
+          </div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// AI auto-correlation suggestions
+
+function CorrelateModal({ onClose }: { onClose: () => void }) {
+  const [links, setLinks] = useState<AiLink[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
+
+  async function run() {
+    setBusy(true); setErr(""); setLinks(null);
+    try { const r = await api.aiCorrelate(); setLinks(r.links); }
+    catch { setErr("Correlation failed — check the AI/Ollama connection."); }
+    finally { setBusy(false); }
+  }
+  useEffect(() => { run(); }, []);
+
+  const conf = (c: string) => (c === "high" ? "crit" : c === "medium" ? "rel-B" : "rel-C");
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title"><Link2 size={16} /> AI correlation suggestions</div>
+          <div className="spacer" />
+          <button className="icon-btn" data-tooltip="Re-run" aria-label="Re-run" disabled={busy} onClick={run}><RefreshCw size={16} className={busy ? "spin" : ""} /></button>
+          <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body" style={{ padding: 16 }}>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>The model proposes likely CVE↔IOC / campaign links from current top vulnerabilities and indicators. Suggestions only — verify before acting.</div>
+          {busy && <div className="empty">Analyzing…</div>}
+          {err && <div className="login-error">{err}</div>}
+          {links && links.length === 0 && !busy && <div className="empty">No well-supported links proposed.</div>}
+          {links?.map((l, i) => (
+            <div className="ov-row" key={i}>
+              <span className={`badge ${conf(l.confidence)}`}>{l.confidence}</span>
+              <div className="ov-row-text">
+                <div className="ov-primary mono">{l.cve} ↔ {defang(l.ioc)}{l.malware && <span className="muted"> · {l.malware}</span>}</div>
+                <div className="ov-secondary muted">{l.rationale}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Automation rules (admin)
+
+function RulesPanel({ onClose }: { onClose: () => void }) {
+  const [rules, setRules] = useState<Rule[]>([]);
+  const [name, setName] = useState("");
+  const [minRisk, setMinRisk] = useState(75);
+  const [exploitedOnly, setExploitedOnly] = useState(false);
+  const [stackOnly, setStackOnly] = useState(true);
+  const [action, setAction] = useState<"webhook" | "email" | "jira">("webhook");
+  const [target, setTarget] = useState("");
+  const [error, setError] = useState("");
+
+  const load = useCallback(() => { api.rules().then(setRules).catch(() => {}); }, []);
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
+
+  async function add(e: FormEvent) {
+    e.preventDefault();
+    setError("");
+    if (!name.trim()) { setError("Name required."); return; }
+    const config: Record<string, unknown> = action === "webhook" ? { url: target } : action === "email" ? { to: target } : {};
+    try { await api.createRule({ name: name.trim(), enabled: true, minRisk, exploitedOnly, stackOnly, action, config }); setName(""); setTarget(""); load(); }
+    catch (err) { setError((err as Error).message); }
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title"><Workflow size={16} /> Automation rules</div>
+          <div className="spacer" />
+          <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body" style={{ padding: 16 }}>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>When a vulnerability matches the trigger, run the action. With no rules, OmniSight uses the <code>.env</code> stack-alert defaults.</div>
+          <form onSubmit={add} className="rule-form">
+            <input className="note-input" placeholder="Rule name" value={name} onChange={(e) => setName(e.target.value)} />
+            <label className="rule-field">Min risk <input className="note-input rule-num" type="number" min={0} max={100} value={minRisk} onChange={(e) => setMinRisk(Number(e.target.value))} /></label>
+            <label className="rule-check"><input type="checkbox" checked={exploitedOnly} onChange={(e) => setExploitedOnly(e.target.checked)} /> Exploited only</label>
+            <label className="rule-check"><input type="checkbox" checked={stackOnly} onChange={(e) => setStackOnly(e.target.checked)} /> My Stack only</label>
+            <select className="page-size" value={action} onChange={(e) => setAction(e.target.value as "webhook" | "email" | "jira")}>
+              <option value="webhook">webhook</option>
+              <option value="email">email</option>
+              <option value="jira">jira</option>
+            </select>
+            {action !== "jira" && (
+              <input className="note-input" placeholder={action === "webhook" ? "https://hooks.slack.com/…" : "alerts@example.com"} value={target} onChange={(e) => setTarget(e.target.value)} />
+            )}
+            <button className="btn-primary" type="submit"><Plus size={16} /> Add</button>
+          </form>
+          {error && <div className="login-error">{error}</div>}
+          {rules.length === 0 && <div className="empty">No rules yet.</div>}
+          {rules.map((r) => (
+            <div className="ov-row" key={r.id}>
+              <button className="icon-btn" data-tooltip={r.enabled ? "Disable" : "Enable"} aria-label="Toggle" onClick={() => api.updateRule(r.id, { enabled: !r.enabled }).then(load).catch(() => {})}>
+                {r.enabled ? <Workflow size={16} /> : <ShieldOff size={16} />}
+              </button>
+              <div className="ov-row-text">
+                <div className="ov-primary">{r.name} {!r.enabled && <span className="muted">(disabled)</span>}</div>
+                <div className="ov-secondary muted">
+                  risk ≥ {r.minRisk}{r.exploitedOnly ? " · exploited" : ""}{r.stackOnly ? " · my-stack" : ""} → {r.action}
+                  {typeof r.config.url === "string" ? ` (${r.config.url.slice(0, 32)}…)` : typeof r.config.to === "string" ? ` (${r.config.to})` : ""}
+                </div>
+              </div>
+              <button className="icon-btn note-del" data-tooltip="Delete" aria-label="Delete rule" onClick={() => api.deleteRule(r.id).then(load).catch(() => {})}><Trash2 size={14} /></button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function StackPanel({ terms, onChange }: { terms: string[]; onChange: () => void }) {
   const [term, setTerm] = useState("");
 
@@ -1939,21 +2141,35 @@ function AddFeed({ onAdded }: { onAdded: () => void }) {
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
   const [itemsPath, setItemsPath] = useState("");
+  const [feedKind, setFeedKind] = useState<"json" | "taxii">("json");
+  const [taxiiUser, setTaxiiUser] = useState("");
+  const [taxiiSecret, setTaxiiSecret] = useState("");
   const [msg, setMsg] = useState("");
 
   async function submit(e: FormEvent) {
     e.preventDefault();
     setMsg("");
-    const body: NewSource = {
-      name, kind: "json", signalType: "vulnerability", url,
-      schedule: "0 */6 * * *", enabled: true, requiresAuth: false,
-      config: { itemsPath, map: {} },
-    };
+    // Basic auth when a username is given (e.g. Pulsedive: taxii2 / <api key>);
+    // otherwise treat the secret as a Bearer token.
+    const taxiiConfig: Record<string, string> = taxiiUser
+      ? { username: taxiiUser, password: taxiiSecret }
+      : taxiiSecret ? { token: taxiiSecret } : {};
+    const body: NewSource = feedKind === "taxii"
+      ? {
+          name, kind: "taxii", signalType: "indicator", url,
+          schedule: "0 */6 * * *", enabled: true, requiresAuth: Boolean(taxiiSecret),
+          config: taxiiConfig,
+        }
+      : {
+          name, kind: "json", signalType: "vulnerability", url,
+          schedule: "0 */6 * * *", enabled: true, requiresAuth: false,
+          config: { itemsPath, map: {} },
+        };
     try {
       const created = await api.addSource(body);
       await api.runSource(created.id);
       setMsg(`Added "${created.name}" and triggered first fetch.`);
-      setName(""); setUrl(""); setItemsPath("");
+      setName(""); setUrl(""); setItemsPath(""); setTaxiiUser(""); setTaxiiSecret("");
       onAdded();
     } catch (err) {
       setMsg(`Error: ${(err as Error).message}`);
@@ -1965,21 +2181,44 @@ function AddFeed({ onAdded }: { onAdded: () => void }) {
       <div className="section-head"><h2>Add Feed</h2></div>
       <form onSubmit={submit}>
         <div className="field">
+          <label>Feed type</label>
+          <select className="page-size" value={feedKind} onChange={(e) => setFeedKind(e.target.value as "json" | "taxii")}>
+            <option value="json">Generic JSON (vulnerabilities)</option>
+            <option value="taxii">TAXII 2.1 (indicators)</option>
+          </select>
+        </div>
+        <div className="field">
           <label>Feed name</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="My CVE feed" required />
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder={feedKind === "taxii" ? "My TAXII collection" : "My CVE feed"} required />
         </div>
         <div className="field">
-          <label>JSON URL</label>
-          <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://example.com/feed.json" required />
+          <label>{feedKind === "taxii" ? "Collection objects URL" : "JSON URL"}</label>
+          <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder={feedKind === "taxii" ? "https://server/taxii2/<root>/collections/<id>/objects/" : "https://example.com/feed.json"} required />
         </div>
-        <div className="field">
-          <label>Items path</label>
-          <input value={itemsPath} onChange={(e) => setItemsPath(e.target.value)} placeholder="vulnerabilities" />
-        </div>
+        {feedKind === "json" && (
+          <div className="field">
+            <label>Items path</label>
+            <input value={itemsPath} onChange={(e) => setItemsPath(e.target.value)} placeholder="vulnerabilities" />
+          </div>
+        )}
+        {feedKind === "taxii" && (
+          <>
+            <div className="field">
+              <label>Username (optional)</label>
+              <input value={taxiiUser} onChange={(e) => setTaxiiUser(e.target.value)} placeholder="e.g. taxii2 (Pulsedive)" />
+            </div>
+            <div className="field">
+              <label>Password / API key / token</label>
+              <input value={taxiiSecret} onChange={(e) => setTaxiiSecret(e.target.value)} placeholder="Basic password with a username, else Bearer token" />
+            </div>
+          </>
+        )}
         <button className="btn-primary" type="submit"><Plus size={16} /> Add</button>
       </form>
       <div className="hint">
-        Generic JSON connector — point it at any feed, set the array path, and OmniSight ingests it. No code required.
+        {feedKind === "taxii"
+          ? "Polls a TAXII 2.1 collection's objects endpoint and ingests STIX indicators on schedule."
+          : "Generic JSON connector — point it at any feed, set the array path, and OmniSight ingests it. No code required."}
         {msg && <span style={{ display: "block", marginTop: 6 }}>{msg}</span>}
       </div>
     </div>

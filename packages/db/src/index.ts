@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import pg from "pg";
 import {
   computeRiskScore, buildDigest,
-  type Source, type Vulnerability, type Indicator, type Advisory, type Digest, type User, type Role,
+  type Source, type Vulnerability, type Indicator, type Advisory, type Digest, type User, type Role, type Breach,
 } from "@omnisight/shared";
 
 export interface ListOptions {
@@ -132,6 +132,25 @@ export interface AuditEntry {
   method: string;
   path: string;
   status: number | null;
+}
+
+export type RuleAction = "webhook" | "email" | "jira";
+
+/** A user-defined automation rule: when a vuln matches, run an action. */
+export interface Rule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  /** Trigger: risk_score ≥ minRisk. */
+  minRisk: number;
+  /** Trigger: require known_exploited. */
+  exploitedOnly: boolean;
+  /** Trigger: require a "My Stack" match. */
+  stackOnly: boolean;
+  action: RuleAction;
+  /** Action params, e.g. { url } for webhook, { to } for email. */
+  config: Record<string, unknown>;
+  createdAt: string;
 }
 
 // AML.T#### (ATLAS) must come first so it isn't split into a bare T####.
@@ -269,6 +288,17 @@ export interface Repository {
   appendAudit(entry: Omit<AuditEntry, "id" | "at">): Promise<void>;
   /** Recent audit-log entries, newest first. */
   listAudit(limit?: number): Promise<AuditEntry[]>;
+  /** Upsert breach-exposure records (keyed on breach id). */
+  upsertBreaches(items: Breach[]): Promise<number>;
+  /** Breach-exposure records, newest first. */
+  listBreaches(limit?: number): Promise<Breach[]>;
+  /** Automation rules (event→action). */
+  listRules(): Promise<Rule[]>;
+  createRule(rule: Omit<Rule, "id" | "createdAt">): Promise<Rule>;
+  updateRule(id: string, patch: Partial<Omit<Rule, "id" | "createdAt">>): Promise<void>;
+  deleteRule(id: string): Promise<void>;
+  /** Un-alerted vulns that could trigger a rule (exploited or risk ≥ floor). */
+  pendingRuleCandidates(floorRisk: number): Promise<Vulnerability[]>;
   upsertSource(source: Source): Promise<void>;
   listSources(): Promise<Source[]>;
   stats(): Promise<Stats>;
@@ -430,6 +460,43 @@ export class InMemoryRepository implements Repository {
   }
   async listAudit(limit = 200): Promise<AuditEntry[]> {
     return this.audit.slice(0, limit);
+  }
+
+  private breaches = new Map<string, Breach>();
+  async upsertBreaches(items: Breach[]): Promise<number> {
+    for (const b of items) this.breaches.set(b.id, b);
+    return items.length;
+  }
+  async listBreaches(limit = 200): Promise<Breach[]> {
+    return [...this.breaches.values()]
+      .sort((a, b) => (b.breachDate ?? "").localeCompare(a.breachDate ?? ""))
+      .slice(0, limit);
+  }
+
+  private rules = new Map<string, Rule>();
+  async listRules(): Promise<Rule[]> {
+    return [...this.rules.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+  async createRule(rule: Omit<Rule, "id" | "createdAt">): Promise<Rule> {
+    const r: Rule = { ...rule, id: newId(), createdAt: new Date().toISOString() };
+    this.rules.set(r.id, r);
+    return r;
+  }
+  async updateRule(id: string, patch: Partial<Omit<Rule, "id" | "createdAt">>): Promise<void> {
+    const r = this.rules.get(id);
+    if (r) this.rules.set(id, { ...r, ...patch });
+  }
+  async deleteRule(id: string): Promise<void> {
+    this.rules.delete(id);
+  }
+  async pendingRuleCandidates(floorRisk: number): Promise<Vulnerability[]> {
+    const out: Vulnerability[] = [];
+    for (const v of this.vulns.values()) {
+      if (this.alertLog.has(`${v.source}:${v.id}`)) continue;
+      if (!(v.knownExploited || v.riskScore >= floorRisk)) continue;
+      out.push(v);
+    }
+    return out.sort((a, b) => b.riskScore - a.riskScore).slice(0, 200);
   }
 
   async upsertIndicators(items: Indicator[]): Promise<number> {
@@ -1270,6 +1337,99 @@ export class PostgresRepository implements Repository {
       path: r.path as string,
       status: r.status != null ? Number(r.status) : null,
     }));
+  }
+
+  async upsertBreaches(items: Breach[]): Promise<number> {
+    for (const b of items) {
+      await this.pool.query(
+        `INSERT INTO breaches (id,domain,title,breach_date,added_date,pwn_count,data_classes,description,verified,fetched_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           ON CONFLICT (id) DO UPDATE SET
+             domain=EXCLUDED.domain, title=EXCLUDED.title, breach_date=EXCLUDED.breach_date,
+             added_date=EXCLUDED.added_date, pwn_count=EXCLUDED.pwn_count, data_classes=EXCLUDED.data_classes,
+             description=EXCLUDED.description, verified=EXCLUDED.verified, fetched_at=EXCLUDED.fetched_at`,
+        [b.id, b.domain, b.title, b.breachDate, b.addedDate, b.pwnCount, JSON.stringify(b.dataClasses), b.description, b.verified, b.fetchedAt],
+      );
+    }
+    return items.length;
+  }
+
+  async listBreaches(limit = 200): Promise<Breach[]> {
+    const { rows } = await this.pool.query(`SELECT * FROM breaches ORDER BY breach_date DESC NULLS LAST LIMIT $1`, [Math.min(limit, 500)]);
+    return rows.map((r) => ({
+      id: r.id as string,
+      domain: r.domain as string,
+      title: r.title as string,
+      breachDate: r.breach_date ? new Date(r.breach_date as string).toISOString().slice(0, 10) : null,
+      addedDate: r.added_date ? new Date(r.added_date as string).toISOString() : null,
+      pwnCount: Number(r.pwn_count ?? 0),
+      dataClasses: (r.data_classes as string[]) ?? [],
+      description: (r.description as string) ?? "",
+      verified: Boolean(r.verified),
+      fetchedAt: new Date(r.fetched_at as string).toISOString(),
+    }));
+  }
+
+  private rowToRule(r: Record<string, unknown>): Rule {
+    return {
+      id: r.id as string,
+      name: r.name as string,
+      enabled: Boolean(r.enabled),
+      minRisk: Number(r.min_risk ?? 75),
+      exploitedOnly: Boolean(r.exploited_only),
+      stackOnly: Boolean(r.stack_only),
+      action: r.action as RuleAction,
+      config: (r.config as Record<string, unknown>) ?? {},
+      createdAt: new Date(r.created_at as string).toISOString(),
+    };
+  }
+
+  async listRules(): Promise<Rule[]> {
+    const { rows } = await this.pool.query(`SELECT * FROM rules ORDER BY created_at ASC`);
+    return rows.map((r) => this.rowToRule(r));
+  }
+
+  async createRule(rule: Omit<Rule, "id" | "createdAt">): Promise<Rule> {
+    const id = newId();
+    const { rows } = await this.pool.query(
+      `INSERT INTO rules (id,name,enabled,min_risk,exploited_only,stack_only,action,config)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [id, rule.name, rule.enabled, rule.minRisk, rule.exploitedOnly, rule.stackOnly, rule.action, JSON.stringify(rule.config ?? {})],
+    );
+    return this.rowToRule(rows[0]);
+  }
+
+  async updateRule(id: string, patch: Partial<Omit<Rule, "id" | "createdAt">>): Promise<void> {
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    const col: Record<string, string> = {
+      name: "name", enabled: "enabled", minRisk: "min_risk",
+      exploitedOnly: "exploited_only", stackOnly: "stack_only", action: "action", config: "config",
+    };
+    for (const [k, v] of Object.entries(patch)) {
+      const c = col[k];
+      if (!c) continue;
+      params.push(k === "config" ? JSON.stringify(v) : v);
+      sets.push(`${c} = $${params.length}`);
+    }
+    if (!sets.length) return;
+    params.push(id);
+    await this.pool.query(`UPDATE rules SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+  }
+
+  async deleteRule(id: string): Promise<void> {
+    await this.pool.query(`DELETE FROM rules WHERE id = $1`, [id]);
+  }
+
+  async pendingRuleCandidates(floorRisk: number): Promise<Vulnerability[]> {
+    const { rows } = await this.pool.query(
+      `SELECT v.* FROM vulnerabilities v
+         WHERE (v.known_exploited = TRUE OR v.risk_score >= $1)
+           AND NOT EXISTS (SELECT 1 FROM alert_log a WHERE a.id = v.source || ':' || v.id)
+         ORDER BY v.risk_score DESC LIMIT 200`,
+      [floorRisk],
+    );
+    return rows.map(rowToVuln);
   }
 
   async stats(): Promise<Stats> {

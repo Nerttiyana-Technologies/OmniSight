@@ -7,7 +7,7 @@ import { createRepository, composeDigest } from "@omnisight/db";
 import type { Digest, Vulnerability } from "@omnisight/shared";
 import {
   resolveConnector, resolveIndicatorConnector, resolveAdvisoryConnector,
-  seedSources, fetchEpss, fetchNvdCvss, fetchGeo, sleep,
+  seedSources, fetchEpss, fetchNvdCvss, fetchGeo, sleep, fetchBreaches,
 } from "@omnisight/connectors";
 
 // Load the repo-root .env so DATABASE_URL/REDIS_URL match the API process.
@@ -95,6 +95,17 @@ async function scheduleAll() {
     await queue.add("digest", {}, { delay: 30000, jobId: "now-digest", removeOnComplete: true });
   }
 
+  // Breach exposure check daily at 05:00 (only does work when HIBP_DOMAINS set).
+  if ((process.env.HIBP_DOMAINS ?? "").trim()) {
+    await queue.add("breaches", {}, {
+      repeat: { pattern: "0 5 * * *" },
+      jobId: "repeat:breaches",
+      removeOnComplete: 5,
+      removeOnFail: 5,
+    });
+    await queue.add("breaches", {}, { delay: 25000, jobId: "now-breaches", removeOnComplete: true });
+  }
+
   console.log(`[worker] scheduled ${sources.length} source(s) + enrichment + daily brief`);
 }
 
@@ -165,44 +176,86 @@ async function createJiraTickets(hits: Vulnerability[]): Promise<number> {
   return created;
 }
 
-/** Alert on stack-affecting vulnerabilities via webhook (Slack-style) and/or email. */
-async function runAlerts(): Promise<void> {
-  const minRisk = Number(process.env.ALERT_MIN_RISK ?? 75);
-  const hits = await repo.pendingStackAlerts(minRisk);
-  if (hits.length === 0) return;
-
+function alertText(hits: Vulnerability[]): string {
   const lines = hits.slice(0, 25).map(
     (v) => `• [${v.riskScore}] ${v.cveId ?? v.id} — ${v.title}` +
       `${v.vendor ? ` (${v.vendor}${v.product ? "/" + v.product : ""})` : ""}${v.knownExploited ? " — EXPLOITED" : ""}`,
   );
-  const text = `OmniSight: ${hits.length} stack-affecting vulnerability(ies)\n${lines.join("\n")}`;
-
-  const webhook = process.env.ALERT_WEBHOOK?.trim();
-  if (webhook) {
-    try {
-      await fetch(webhook, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }) });
-    } catch (e) {
-      console.warn(`[worker] alert webhook failed: ${(e as Error).message}`);
-    }
-  }
-
-  const to = process.env.ALERT_TO?.trim() || process.env.DIGEST_TO?.trim();
+  return `OmniSight: ${hits.length} vulnerability(ies)\n${lines.join("\n")}`;
+}
+function alertHtml(hits: Vulnerability[]): string {
+  return `<h3 style="font-family:sans-serif">OmniSight — ${hits.length} vulnerability(ies)</h3>` +
+    `<ul style="font-family:sans-serif;font-size:14px">${hits.slice(0, 25).map((v) =>
+      `<li><b>[${v.riskScore}] ${v.cveId ?? v.id}</b> — ${v.title}${v.knownExploited ? " · <span style='color:#c5343a'>EXPLOITED</span>" : ""}</li>`).join("")}</ul>`;
+}
+async function sendWebhook(url: string, hits: Vulnerability[]): Promise<void> {
+  try {
+    await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: alertText(hits) }) });
+  } catch (e) { console.warn(`[worker] webhook failed: ${(e as Error).message}`); }
+}
+async function sendEmailAlert(to: string, hits: Vulnerability[]): Promise<void> {
   const transport = mailTransport();
-  if (transport && to) {
-    const html = `<h3 style="font-family:sans-serif">OmniSight — ${hits.length} stack-affecting vulnerability(ies)</h3>` +
-      `<ul style="font-family:sans-serif;font-size:14px">${hits.slice(0, 25).map((v) =>
-        `<li><b>[${v.riskScore}] ${v.cveId ?? v.id}</b> — ${v.title}${v.knownExploited ? " · <span style='color:#c5343a'>EXPLOITED</span>" : ""}</li>`).join("")}</ul>`;
-    try {
-      await transport.sendMail({ from: mailFrom(), to, subject: `OmniSight Alert — ${hits.length} stack-affecting vuln(s)`, html, text });
-    } catch (e) {
-      console.warn(`[worker] alert email failed: ${(e as Error).message}`);
-    }
+  if (!transport || !to) return;
+  try {
+    await transport.sendMail({ from: mailFrom(), to, subject: `OmniSight Alert — ${hits.length} vuln(s)`, html: alertHtml(hits), text: alertText(hits) });
+  } catch (e) { console.warn(`[worker] email alert failed: ${(e as Error).message}`); }
+}
+
+/** True if a vuln matches any "My Stack" term (vendor/product/title). */
+function inStack(v: Vulnerability, terms: string[]): boolean {
+  if (terms.length === 0) return false;
+  const hay = `${v.vendor ?? ""} ${v.product ?? ""} ${v.title}`.toLowerCase();
+  return terms.some((t) => hay.includes(t));
+}
+
+/**
+ * Alerting. If the user has defined automation rules, evaluate them
+ * (event→action); otherwise fall back to the env-configured stack alert.
+ */
+async function runAlerts(): Promise<void> {
+  const rules = (await repo.listRules().catch(() => [])).filter((r) => r.enabled);
+
+  if (rules.length === 0) {
+    // Legacy/default path: stack-affecting vulns → env webhook/email/Jira.
+    const minRisk = Number(process.env.ALERT_MIN_RISK ?? 75);
+    const hits = await repo.pendingStackAlerts(minRisk);
+    if (hits.length === 0) return;
+    const webhook = process.env.ALERT_WEBHOOK?.trim();
+    if (webhook) await sendWebhook(webhook, hits);
+    const to = process.env.ALERT_TO?.trim() || process.env.DIGEST_TO?.trim();
+    if (to) await sendEmailAlert(to, hits);
+    const jiraCreated = await createJiraTickets(hits);
+    await repo.markAlerted(hits.map((v) => `${v.source}:${v.id}`));
+    console.log(`[worker] alerts: ${hits.length} stack vuln(s)${webhook ? " (webhook)" : ""}${to ? " (email)" : ""}${jiraCreated ? ` (${jiraCreated} Jira)` : ""}`);
+    return;
   }
 
-  const jiraCreated = await createJiraTickets(hits);
+  // Rules path: fetch candidates above the lowest rule threshold, then match.
+  const floor = Math.min(...rules.map((r) => r.minRisk));
+  const candidates = await repo.pendingRuleCandidates(floor);
+  if (candidates.length === 0) return;
+  const terms = await repo.listWatchlist();
+  const alerted = new Set<string>();
+  let fired = 0;
 
-  await repo.markAlerted(hits.map((v) => `${v.source}:${v.id}`));
-  console.log(`[worker] alerts: ${hits.length} stack-affecting vuln(s) notified${webhook ? " (webhook)" : ""}${to && transport ? " (email)" : ""}${jiraCreated ? ` (${jiraCreated} Jira ticket(s))` : ""}`);
+  for (const rule of rules) {
+    const hits = candidates.filter((v) =>
+      (v.knownExploited || v.riskScore >= rule.minRisk) &&
+      (!rule.exploitedOnly || v.knownExploited) &&
+      (v.riskScore >= rule.minRisk) &&
+      (!rule.stackOnly || inStack(v, terms)),
+    );
+    if (hits.length === 0) continue;
+    fired++;
+    if (rule.action === "webhook" && typeof rule.config.url === "string") await sendWebhook(rule.config.url, hits);
+    else if (rule.action === "email") await sendEmailAlert(String(rule.config.to ?? process.env.ALERT_TO ?? process.env.DIGEST_TO ?? ""), hits);
+    else if (rule.action === "jira") await createJiraTickets(hits);
+    for (const v of hits) alerted.add(`${v.source}:${v.id}`);
+    console.log(`[worker] rule "${rule.name}" (${rule.action}): ${hits.length} match(es)`);
+  }
+
+  if (alerted.size) await repo.markAlerted([...alerted]);
+  console.log(`[worker] alerts: ${rules.length} rule(s), ${fired} fired, ${alerted.size} vuln(s) actioned`);
 }
 
 let enrichRunning = false;
@@ -285,12 +338,29 @@ async function runGeo(): Promise<void> {
   }
 }
 
+/** Check configured domains for known breaches via Have I Been Pwned. */
+async function runBreaches(): Promise<void> {
+  const domains = (process.env.HIBP_DOMAINS ?? "").split(",").map((d) => d.trim().toLowerCase()).filter(Boolean);
+  if (domains.length === 0) return;
+  try {
+    const items = await fetchBreaches(domains, { credentials: { hibpApiKey: process.env.HIBP_API_KEY?.trim() || undefined } });
+    const n = await repo.upsertBreaches(items);
+    if (n > 0) { await repo.signalChange("breaches"); console.log(`[worker] breaches: ${n} record(s) across ${domains.length} domain(s)`); }
+  } catch (e) {
+    console.warn(`[worker] breaches: ${(e as Error).message}`);
+  }
+}
+
 new Worker(
   QUEUE,
   async (job: Job<{ sourceId?: string }>) => {
     if (job.name === "enrich") {
       await runEnrichment();
       return { enriched: true };
+    }
+    if (job.name === "breaches") {
+      await runBreaches();
+      return { ok: true };
     }
     if (job.name === "geo") {
       await runGeo();
@@ -318,6 +388,12 @@ new Worker(
       authKey: process.env.ABUSECH_AUTH_KEY?.trim() || undefined,
       nvdApiKey: process.env.NVD_API_KEY?.trim() || undefined,
       otxApiKey: process.env.OTX_API_KEY?.trim() || undefined,
+      taxiiToken: process.env.TAXII_TOKEN?.trim() || undefined,
+      taxiiUser: process.env.TAXII_USER?.trim() || undefined,
+      taxiiPass: process.env.TAXII_PASS?.trim() || undefined,
+      pulsediveKey: process.env.PULSEDIVE_API_KEY?.trim() || undefined,
+      pulsediveQuery: process.env.PULSEDIVE_QUERY?.trim() || undefined,
+      pulsediveLimit: process.env.PULSEDIVE_LIMIT?.trim() || undefined,
     };
 
     if (source.signalType === "indicator") {

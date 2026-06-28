@@ -27,8 +27,10 @@ records are keyed on `(source, id)` so each is preserved, and enrichment applies
 to all of them — the seed of cross-source correlation.
 
 Beyond vulnerabilities, OmniSight also ingests **indicators of compromise** via
-the **abuse.ch ThreatFox** and **AlienVault OTX** connectors (IPs, domains, URLs,
-hashes with malware context — need `ABUSECH_AUTH_KEY` / `OTX_API_KEY`). The
+the **abuse.ch ThreatFox**, **AlienVault OTX**, and **Pulsedive** connectors (IPs,
+domains, URLs, hashes with malware context — need `ABUSECH_AUTH_KEY` /
+`OTX_API_KEY` / `PULSEDIVE_API_KEY`). Pulsedive uses its **free REST Explore API**
+(a free key works; the paid TAXII server isn't required). The
 dashboard has a **Vulnerabilities** and an **Indicators** tab, each with its own
 filter/sort/paginate grid.
 
@@ -78,11 +80,33 @@ related CVEs and ATT&CK/ATLAS techniques extracted from their intel — with
 sample IOCs you can pivot into enrichment. Assembled entirely from ingested
 feeds, so it grows as you connect more sources.
 
-### SOAR-lite ticketing
+### SOAR-lite ticketing & automation rules
 
 Beyond webhook and email alerts, the worker can **open a Jira issue per
 stack-affecting vulnerability** (`JIRA_*` vars, Jira Cloud REST v2) — turning
 "a KEV just hit my stack" into an actionable, de-duplicated ticket automatically.
+For finer control, admins define **automation rules** in the dashboard: each rule
+is a trigger (risk threshold, exploited-only, My-Stack-only) plus an action
+(webhook / email / Jira). When any rule exists it replaces the env defaults, so
+you can route, say, "exploited + my-stack → Jira" and "critical anywhere → Slack"
+independently.
+
+### TAXII 2.1 polling
+
+Add a **TAXII** feed from the dashboard (or `POST /api/sources` with
+`kind: "taxii"`): OmniSight polls the collection's objects endpoint on a schedule,
+parses the STIX 2.1 bundle, and ingests the indicators — complementing the
+existing STIX file import with live, scheduled pulls from OpenCTI / MISP / ISAC /
+government TAXII servers. Bearer-token or basic auth, per feed.
+
+### Breach exposure (Have I Been Pwned)
+
+An **Exposure** tab monitors the domains you list in `HIBP_DOMAINS` for known
+breaches via Have I Been Pwned — which breaches hit your brands, when, how many
+accounts, and what data classes leaked. It pulls HIBP's **free public breaches
+collection** (no API key, no subscription) and filters it to your domains
+locally, rather than the paid domain-search API; the worker refreshes daily.
+`HIBP_API_KEY` is optional and only raises rate limits.
 
 ### Map
 
@@ -123,7 +147,10 @@ of your stack rather than trapping it.
 The Overview surfaces **CVE↔IOC correlations**: CVE references found inside
 indicator tags/threat context are linked to tracked vulnerabilities (risk-ranked),
 showing which CVEs the active indicators relate to. (Linkage is only as rich as
-the feeds — IOC sources cite CVEs intermittently.)
+the feeds — IOC sources cite CVEs intermittently.) When an LLM is configured, an
+**AI correlation** view goes further — reasoning over the top CVEs and indicators
+to propose CVE↔IOC / campaign relationships with a confidence and rationale
+(suggestions to verify, not ground truth).
 
 ### Daily brief email
 
