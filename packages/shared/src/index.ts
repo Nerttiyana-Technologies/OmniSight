@@ -427,6 +427,48 @@ export function parseStixIndicators(bundle: unknown): { value: string; type: Ind
   return out;
 }
 
+// --- Breach / leaked-credential exposure (Have I Been Pwned) ----------------
+
+export interface Breach {
+  /** HIBP breach Name (unique slug). */
+  id: string;
+  domain: string;
+  title: string;
+  breachDate: string | null;
+  addedDate: string | null;
+  pwnCount: number;
+  dataClasses: string[];
+  description: string;
+  verified: boolean;
+  fetchedAt: string;
+}
+
+interface HibpBreachRaw {
+  Name?: string; Title?: string; Domain?: string; BreachDate?: string;
+  AddedDate?: string; PwnCount?: number; DataClasses?: string[];
+  Description?: string; IsVerified?: boolean;
+}
+
+/** Normalize HIBP `/breaches?Domain=` results into OmniSight Breach records. */
+export function normalizeHibpBreaches(raw: unknown, domain: string): Breach[] {
+  const arr = Array.isArray(raw) ? (raw as HibpBreachRaw[]) : [];
+  const fetchedAt = new Date().toISOString();
+  return arr
+    .filter((b) => b.Name)
+    .map((b) => ({
+      id: b.Name!,
+      domain: (b.Domain || domain).toLowerCase(),
+      title: b.Title ?? b.Name!,
+      breachDate: b.BreachDate ?? null,
+      addedDate: b.AddedDate ?? null,
+      pwnCount: typeof b.PwnCount === "number" ? b.PwnCount : 0,
+      dataClasses: Array.isArray(b.DataClasses) ? b.DataClasses : [],
+      description: (b.Description ?? "").replace(/<[^>]+>/g, ""), // strip HTML
+      verified: Boolean(b.IsVerified),
+      fetchedAt,
+    }));
+}
+
 // --- Daily brief / digest --------------------------------------------------
 
 export type DigestTone = "critical" | "high" | "medium" | "low" | "info";

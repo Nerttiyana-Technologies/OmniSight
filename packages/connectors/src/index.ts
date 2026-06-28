@@ -7,6 +7,8 @@ import { otxConnector } from "./otx.js";
 import { makeRssConnector } from "./rss.js";
 import { atlasConnector } from "./atlas.js";
 import { makeGenericJsonConnector } from "./generic-json.js";
+import { makeTaxiiConnector } from "./taxii.js";
+import { pulsediveConnector } from "./pulsedive.js";
 
 export * from "./types.js";
 export { cisaKevConnector, normalizeKev } from "./cisa-kev.js";
@@ -16,12 +18,15 @@ export { otxConnector, normalizeOtx } from "./otx.js";
 export { makeRssConnector, parseRss } from "./rss.js";
 export { atlasConnector, normalizeAtlas } from "./atlas.js";
 export { makeGenericJsonConnector } from "./generic-json.js";
+export { makeTaxiiConnector, normalizeTaxii } from "./taxii.js";
+export { pulsediveConnector, normalizePulsedive } from "./pulsedive.js";
 export {
   fetchEpss, parseEpss, fetchNvdCvss, extractCvss, cvssFromMetrics, sleep,
   fetchGeo, parseGeo, type EpssResult, type GeoResult,
 } from "./enrichers.js";
 export { enrichIoc, parseShodan, parseGreynoise, parseAbuse, type IocEnrichment } from "./enrich-ioc.js";
 export { parseSbom, parsePurl, queryOsvBatch, type SbomComponent, type SbomResult } from "./sbom.js";
+export { fetchBreaches, fetchBreachesForDomain } from "./hibp.js";
 
 /** Built-in vulnerability connectors, keyed by source slug. */
 export const builtinConnectors: Record<string, Connector> = {
@@ -33,12 +38,14 @@ export const builtinConnectors: Record<string, Connector> = {
 export const builtinIndicatorConnectors: Record<string, IndicatorConnector> = {
   [threatfoxConnector.id]: threatfoxConnector,
   [otxConnector.id]: otxConnector,
+  [pulsediveConnector.id]: pulsediveConnector,
 };
 
 export function resolveIndicatorConnector(source: Source): IndicatorConnector {
   const c = builtinIndicatorConnectors[source.id];
-  if (!c) throw new Error(`No indicator connector available for source "${source.id}"`);
-  return c;
+  if (c) return c;
+  if (source.kind === "taxii") return makeTaxiiConnector(source);
+  throw new Error(`No indicator connector available for source "${source.id}"`);
 }
 
 /** Built-in advisory connectors (besides config-driven RSS). */
@@ -111,6 +118,17 @@ const seedSourcesRaw: Omit<Source, "reliability">[] = [
     config: {},
   },
   {
+    id: "pulsedive",
+    name: "Pulsedive",
+    kind: "builtin",
+    signalType: "indicator",
+    url: null,
+    schedule: "0 */6 * * *",
+    enabled: true,
+    requiresAuth: true,
+    config: {},
+  },
+  {
     id: "mitre-atlas",
     name: "MITRE ATLAS",
     kind: "builtin",
@@ -159,7 +177,7 @@ const seedSourcesRaw: Omit<Source, "reliability">[] = [
 // Admiralty-style source grades: A authoritative · B usually reliable · C fairly.
 const SEED_RELIABILITY: Record<string, Source["reliability"]> = {
   "cisa-kev": "A", nvd: "A", "mitre-atlas": "A",
-  threatfox: "B", otx: "C",
+  threatfox: "B", otx: "C", pulsedive: "B",
   "securityweek-ai": "C", thehackernews: "C", darkreading: "C",
 };
 

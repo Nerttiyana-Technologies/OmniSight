@@ -441,3 +441,14 @@ th.sortable:hover { color: var(--accent); }
 
 /* Audit log rows */
 .audit-row .ov-primary { font-size: 13px; }
+
+/* Breach exposure rows */
+.breach-row .badge { min-width: 52px; text-align: center; }
+
+/* Automation rules form */
+.rule-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+.rule-form .note-input { flex: 1; min-width: 160px; }
+.rule-field { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-muted); white-space: nowrap; }
+.rule-num { width: 70px; flex: none; }
+.rule-check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-muted); white-space: nowrap; }
+.rule-check input { accent-color: var(--accent); }

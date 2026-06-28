@@ -13,7 +13,7 @@ import { hashPassword, verifyPassword, signJwt, verifyJwt, type TokenPayload } f
 import { llmConfigured, llmChat, coerceVulnFilters } from "./llm.js";
 import {
   cisaKevConnector, resolveConnector, resolveIndicatorConnector, resolveAdvisoryConnector,
-  seedSources, fetchEpss, enrichIoc, parseSbom, queryOsvBatch,
+  seedSources, fetchEpss, enrichIoc, parseSbom, queryOsvBatch, fetchBreaches,
 } from "@omnisight/connectors";
 
 // Load the repo-root .env (pnpm runs scripts from the package dir, so resolve up).
@@ -97,7 +97,7 @@ app.addHook("onRequest", async (req, reply) => {
   (req as { user?: TokenPayload }).user = user;
 
   const write = !["GET", "HEAD", "OPTIONS"].includes(req.method);
-  const isAdminPath = url.startsWith("/api/users") || url.startsWith("/api/audit") || (url.startsWith("/api/sources") && write && !url.endsWith("/run"));
+  const isAdminPath = url.startsWith("/api/users") || url.startsWith("/api/audit") || url.startsWith("/api/rules") || (url.startsWith("/api/sources") && write && !url.endsWith("/run"));
   if (isAdminPath && !roleAtLeast(user.role, "admin")) return reply.status(403).send({ error: "admin role required" });
   // /api/ai/* is read-only analysis — viewers may use it.
   if (write && !url.startsWith("/api/ai/") && !roleAtLeast(user.role, "analyst")) return reply.status(403).send({ error: "analyst role required" });
@@ -288,6 +288,49 @@ app.get("/api/actors/:name", async (req, reply) => {
   return profile;
 });
 
+// --- Breach exposure (Have I Been Pwned) ---
+function breachDomains(): string[] {
+  return (process.env.HIBP_DOMAINS ?? "").split(",").map((d) => d.trim().toLowerCase()).filter(Boolean);
+}
+app.get("/api/breaches", async () => repo.listBreaches(200));
+app.post("/api/breaches/run", async (_req, reply) => {
+  const domains = breachDomains();
+  if (domains.length === 0) return reply.status(400).send({ error: "no domains configured (set HIBP_DOMAINS)" });
+  try {
+    const items = await fetchBreaches(domains, { credentials: { hibpApiKey: process.env.HIBP_API_KEY?.trim() || undefined } });
+    const n = await repo.upsertBreaches(items);
+    await repo.signalChange("breaches");
+    return { ingested: n };
+  } catch (e) {
+    return reply.status(502).send({ error: (e as Error).message });
+  }
+});
+
+// --- Automation rules (admin) ---
+app.get("/api/rules", async () => repo.listRules());
+app.post("/api/rules", async (req, reply) => {
+  const b = (req.body ?? {}) as Partial<import("@omnisight/db").Rule>;
+  if (!b.name?.trim()) return reply.status(400).send({ error: "name required" });
+  if (!["webhook", "email", "jira"].includes(b.action ?? "")) return reply.status(400).send({ error: "invalid action" });
+  return repo.createRule({
+    name: b.name.trim(),
+    enabled: b.enabled ?? true,
+    minRisk: Number(b.minRisk ?? 75),
+    exploitedOnly: Boolean(b.exploitedOnly),
+    stackOnly: b.stackOnly ?? true,
+    action: b.action as "webhook" | "email" | "jira",
+    config: (b.config as Record<string, unknown>) ?? {},
+  });
+});
+app.patch("/api/rules/:id", async (req) => {
+  await repo.updateRule((req.params as { id: string }).id, (req.body ?? {}) as Partial<import("@omnisight/db").Rule>);
+  return { ok: true };
+});
+app.delete("/api/rules/:id", async (req) => {
+  await repo.deleteRule((req.params as { id: string }).id);
+  return { ok: true };
+});
+
 // --- AI layer (optional LLM) ---
 app.get("/api/ai/config", async () => ({ enabled: llmConfigured() }));
 
@@ -322,6 +365,33 @@ app.post("/api/ai/query", async (req, reply) => {
     const filters = coerceVulnFilters(parsed);
     const { items, total } = await repo.page({ ...filters, limit: 25 });
     return { filters, items, total };
+  } catch (e) {
+    return reply.status(502).send({ error: (e as Error).message });
+  }
+});
+
+// AI-proposed CVE<->IOC relationships beyond the regex correlation, with rationale.
+app.post("/api/ai/correlate", async (_req, reply) => {
+  if (!llmConfigured()) return reply.status(400).send({ error: "AI not configured (set LLM_BASE_URL)" });
+  try {
+    const [top, iocPage] = await Promise.all([
+      repo.page({ sort: "risk", dir: "desc", limit: 20 }).then((r) => r.items),
+      repo.pageIndicators({ sort: "confidence", dir: "desc", limit: 40 }),
+    ]);
+    const vulns = top.map((v) => ({ cve: v.cveId ?? v.id, title: v.title, vendor: v.vendor, risk: v.riskScore, exploited: v.knownExploited }));
+    const iocs = iocPage.items.map((i) => ({ value: i.value, type: i.type, malware: i.malware, threat: i.threatType, tags: i.tags?.slice(0, 6) }));
+    const sys =
+      "You are a threat-intel analyst. Given a list of vulnerabilities and indicators of compromise, " +
+      "propose plausible relationships between them (e.g. an IOC associated with exploitation of a CVE, " +
+      "or IOCs/CVEs tied to the same malware/campaign). Use ONLY the provided data; do not invent CVE or IOC values. " +
+      'Output ONLY JSON: {"links":[{"cve":"CVE-...","ioc":"<value>","malware":"<name|null>","confidence":"high|medium|low","rationale":"<short>"}]}. ' +
+      "Return an empty links array if nothing is well-supported.";
+    const user = JSON.stringify({ vulnerabilities: vulns, indicators: iocs }).slice(0, 8000);
+    const rawOut = await llmChat(sys, user, { json: true });
+    let parsed: { links?: unknown[] } = {};
+    try { parsed = JSON.parse(rawOut); } catch { /* non-JSON */ }
+    const links = Array.isArray(parsed.links) ? parsed.links.slice(0, 25) : [];
+    return { links };
   } catch (e) {
     return reply.status(502).send({ error: (e as Error).message });
   }
@@ -572,6 +642,12 @@ app.post("/api/sources/:id/run", async (req, reply) => {
         credentials: {
           authKey: process.env.ABUSECH_AUTH_KEY?.trim() || undefined,
           otxApiKey: process.env.OTX_API_KEY?.trim() || undefined,
+          taxiiToken: process.env.TAXII_TOKEN?.trim() || undefined,
+          taxiiUser: process.env.TAXII_USER?.trim() || undefined,
+          taxiiPass: process.env.TAXII_PASS?.trim() || undefined,
+          pulsediveKey: process.env.PULSEDIVE_API_KEY?.trim() || undefined,
+          pulsediveQuery: process.env.PULSEDIVE_QUERY?.trim() || undefined,
+          pulsediveLimit: process.env.PULSEDIVE_LIMIT?.trim() || undefined,
         },
       });
       const n = await repo.upsertIndicators(iocs);
