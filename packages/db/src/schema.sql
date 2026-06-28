@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS sources (
   schedule      TEXT NOT NULL DEFAULT '0 */6 * * *',
   enabled       BOOLEAN NOT NULL DEFAULT TRUE,
   requires_auth BOOLEAN NOT NULL DEFAULT FALSE,
+  reliability   TEXT NOT NULL DEFAULT 'C',
   config        JSONB NOT NULL DEFAULT '{}',
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_run_at   TIMESTAMPTZ
@@ -67,6 +68,9 @@ CREATE TABLE IF NOT EXISTS indicators (
   PRIMARY KEY (source, id)
 );
 
+-- Self-migration: add reliability to sources created before it existed.
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS reliability TEXT NOT NULL DEFAULT 'C';
+
 -- Self-migration: add geo columns to indicators tables created before they existed.
 ALTER TABLE indicators ADD COLUMN IF NOT EXISTS country      TEXT;
 ALTER TABLE indicators ADD COLUMN IF NOT EXISTS country_code TEXT;
@@ -101,3 +105,40 @@ CREATE TABLE IF NOT EXISTS watchlist (
   term       TEXT PRIMARY KEY,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Records which stack-affecting vulns have already been alerted (dedupe).
+CREATE TABLE IF NOT EXISTS alert_log (
+  id         TEXT PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Analyst investigation notes attached to a CVE or IOC (ref = "cve:..."/"ioc:...").
+CREATE TABLE IF NOT EXISTS notes (
+  id         TEXT PRIMARY KEY,
+  ref        TEXT NOT NULL,
+  tlp        TEXT NOT NULL DEFAULT 'amber' CHECK (tlp IN ('clear','green','amber','red')),
+  body       TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_notes_ref ON notes (ref);
+
+CREATE TABLE IF NOT EXISTS users (
+  id            TEXT PRIMARY KEY,
+  username      TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  role          TEXT NOT NULL DEFAULT 'viewer' CHECK (role IN ('viewer','analyst','admin')),
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Audit trail: who did what (mutating actions), for security/compliance review.
+CREATE TABLE IF NOT EXISTS audit_log (
+  id         TEXT PRIMARY KEY,
+  at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  username   TEXT,
+  role       TEXT,
+  action     TEXT NOT NULL,
+  method     TEXT NOT NULL,
+  path       TEXT NOT NULL,
+  status     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log (at DESC);

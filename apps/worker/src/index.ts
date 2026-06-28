@@ -4,7 +4,7 @@ import { Queue, Worker, type Job } from "bullmq";
 import IORedis from "ioredis";
 import nodemailer from "nodemailer";
 import { createRepository, composeDigest } from "@omnisight/db";
-import type { Digest } from "@omnisight/shared";
+import type { Digest, Vulnerability } from "@omnisight/shared";
 import {
   resolveConnector, resolveIndicatorConnector, resolveAdvisoryConnector,
   seedSources, fetchEpss, fetchNvdCvss, fetchGeo, sleep,
@@ -67,6 +67,22 @@ async function scheduleAll() {
   });
   await queue.add("geo", {}, { delay: 20000, jobId: "now-geo", removeOnComplete: true });
 
+  // Stack alerts: every 30 min (plus triggered after each vuln ingest).
+  await queue.add("alerts", {}, {
+    repeat: { pattern: "*/30 * * * *" },
+    jobId: "repeat:alerts",
+    removeOnComplete: 20,
+    removeOnFail: 20,
+  });
+
+  // IOC decay: prune stale indicators daily at 04:00.
+  await queue.add("decay", {}, {
+    repeat: { pattern: "0 4 * * *" },
+    jobId: "repeat:decay",
+    removeOnComplete: 5,
+    removeOnFail: 5,
+  });
+
   // Daily brief at 07:00.
   await queue.add("digest", {}, {
     repeat: { pattern: "0 7 * * *" },
@@ -82,15 +98,11 @@ async function scheduleAll() {
   console.log(`[worker] scheduled ${sources.length} source(s) + enrichment + daily brief`);
 }
 
-/** Email the daily brief if SMTP is configured (no-op otherwise). */
-async function sendDigestEmail(d: Digest): Promise<void> {
+/** Shared SMTP transport (null when SMTP isn't configured). */
+function mailTransport() {
   const host = process.env.SMTP_HOST?.trim();
-  const to = process.env.DIGEST_TO?.trim();
-  if (!host || !to) {
-    console.log("[worker] digest email: SMTP_HOST/DIGEST_TO not set — skipping send");
-    return;
-  }
-  const transport = nodemailer.createTransport({
+  if (!host) return null;
+  return nodemailer.createTransport({
     host,
     port: Number(process.env.SMTP_PORT ?? 587),
     secure: process.env.SMTP_SECURE === "true",
@@ -98,14 +110,99 @@ async function sendDigestEmail(d: Digest): Promise<void> {
       ? { user: process.env.SMTP_USER.trim(), pass: (process.env.SMTP_PASS ?? "").trim() }
       : undefined,
   });
-  await transport.sendMail({
-    from: process.env.SMTP_FROM?.trim() || process.env.SMTP_USER?.trim() || "omnisight@localhost",
-    to,
-    subject: `OmniSight Daily Brief — ${d.date}`,
-    html: d.html,
-    text: d.markdown,
-  });
+}
+const mailFrom = () => process.env.SMTP_FROM?.trim() || process.env.SMTP_USER?.trim() || "omnisight@localhost";
+
+/** Email the daily brief if SMTP is configured (no-op otherwise). */
+async function sendDigestEmail(d: Digest): Promise<void> {
+  const to = process.env.DIGEST_TO?.trim();
+  const transport = mailTransport();
+  if (!transport || !to) {
+    console.log("[worker] digest email: SMTP_HOST/DIGEST_TO not set — skipping send");
+    return;
+  }
+  await transport.sendMail({ from: mailFrom(), to, subject: `OmniSight Daily Brief — ${d.date}`, html: d.html, text: d.markdown });
   console.log(`[worker] digest email sent to ${to}`);
+}
+
+/**
+ * SOAR-lite ticketing: open a Jira issue per stack-affecting vuln.
+ * Configure JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY (optional
+ * JIRA_ISSUE_TYPE, default "Task"). Uses Jira Cloud REST v2 (plain-text body).
+ */
+async function createJiraTickets(hits: Vulnerability[]): Promise<number> {
+  const base = process.env.JIRA_URL?.trim().replace(/\/$/, "");
+  const email = process.env.JIRA_EMAIL?.trim();
+  const apiToken = process.env.JIRA_API_TOKEN?.trim();
+  const project = process.env.JIRA_PROJECT_KEY?.trim();
+  if (!base || !email || !apiToken || !project) return 0;
+  const issueType = process.env.JIRA_ISSUE_TYPE?.trim() || "Task";
+  const max = Number(process.env.JIRA_MAX_TICKETS ?? 10);
+  const auth = Buffer.from(`${email}:${apiToken}`).toString("base64");
+
+  let created = 0;
+  for (const v of hits.slice(0, max)) {
+    const summary = `[OmniSight] ${v.cveId ?? v.id} (risk ${v.riskScore})${v.knownExploited ? " — EXPLOITED" : ""} — ${v.title}`.slice(0, 240);
+    const description =
+      `${v.title}\n\n` +
+      `Risk score: ${v.riskScore}\nCVSS: ${v.cvss ?? "n/a"}  EPSS: ${v.epss ?? "n/a"}\n` +
+      `Vendor/Product: ${v.vendor ?? "?"}${v.product ? " / " + v.product : ""}\n` +
+      `Known exploited: ${v.knownExploited ? "yes" : "no"}  Ransomware: ${v.ransomwareUse ? "yes" : "no"}\n` +
+      `Source: ${v.source}\n${v.requiredAction ? `\nRequired action: ${v.requiredAction}\n` : ""}` +
+      `\nReferences:\n${(v.references ?? []).slice(0, 5).join("\n")}`;
+    try {
+      const res = await fetch(`${base}/rest/api/2/issue`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Basic ${auth}` },
+        body: JSON.stringify({ fields: { project: { key: project }, summary, description, issuetype: { name: issueType } } }),
+      });
+      if (res.ok) created++;
+      else console.warn(`[worker] Jira create failed: HTTP ${res.status} ${await res.text().catch(() => "")}`);
+    } catch (e) {
+      console.warn(`[worker] Jira create error: ${(e as Error).message}`);
+    }
+  }
+  return created;
+}
+
+/** Alert on stack-affecting vulnerabilities via webhook (Slack-style) and/or email. */
+async function runAlerts(): Promise<void> {
+  const minRisk = Number(process.env.ALERT_MIN_RISK ?? 75);
+  const hits = await repo.pendingStackAlerts(minRisk);
+  if (hits.length === 0) return;
+
+  const lines = hits.slice(0, 25).map(
+    (v) => `• [${v.riskScore}] ${v.cveId ?? v.id} — ${v.title}` +
+      `${v.vendor ? ` (${v.vendor}${v.product ? "/" + v.product : ""})` : ""}${v.knownExploited ? " — EXPLOITED" : ""}`,
+  );
+  const text = `OmniSight: ${hits.length} stack-affecting vulnerability(ies)\n${lines.join("\n")}`;
+
+  const webhook = process.env.ALERT_WEBHOOK?.trim();
+  if (webhook) {
+    try {
+      await fetch(webhook, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }) });
+    } catch (e) {
+      console.warn(`[worker] alert webhook failed: ${(e as Error).message}`);
+    }
+  }
+
+  const to = process.env.ALERT_TO?.trim() || process.env.DIGEST_TO?.trim();
+  const transport = mailTransport();
+  if (transport && to) {
+    const html = `<h3 style="font-family:sans-serif">OmniSight — ${hits.length} stack-affecting vulnerability(ies)</h3>` +
+      `<ul style="font-family:sans-serif;font-size:14px">${hits.slice(0, 25).map((v) =>
+        `<li><b>[${v.riskScore}] ${v.cveId ?? v.id}</b> — ${v.title}${v.knownExploited ? " · <span style='color:#c5343a'>EXPLOITED</span>" : ""}</li>`).join("")}</ul>`;
+    try {
+      await transport.sendMail({ from: mailFrom(), to, subject: `OmniSight Alert — ${hits.length} stack-affecting vuln(s)`, html, text });
+    } catch (e) {
+      console.warn(`[worker] alert email failed: ${(e as Error).message}`);
+    }
+  }
+
+  const jiraCreated = await createJiraTickets(hits);
+
+  await repo.markAlerted(hits.map((v) => `${v.source}:${v.id}`));
+  console.log(`[worker] alerts: ${hits.length} stack-affecting vuln(s) notified${webhook ? " (webhook)" : ""}${to && transport ? " (email)" : ""}${jiraCreated ? ` (${jiraCreated} Jira ticket(s))` : ""}`);
 }
 
 let enrichRunning = false;
@@ -199,6 +296,16 @@ new Worker(
       await runGeo();
       return { ok: true };
     }
+    if (job.name === "alerts") {
+      await runAlerts();
+      return { ok: true };
+    }
+    if (job.name === "decay") {
+      const days = Number(process.env.DECAY_PRUNE_DAYS ?? 180);
+      const n = await repo.pruneStaleIndicators(days);
+      if (n > 0) { await repo.signalChange("decay"); console.log(`[worker] decay: pruned ${n} indicator(s) older than ${days}d`); }
+      return { ok: true };
+    }
     if (job.name === "digest") {
       const d = await composeDigest(repo);
       console.log(`[worker] daily brief — ${d.headline}`);
@@ -238,6 +345,8 @@ new Worker(
     const n = await repo.upsertVulnerabilities(vulns);
     await repo.signalChange(source.id); // wakes the API's SSE stream
     console.log(`[worker] ${source.id}: ingested ${n}`);
+    // New vulns may affect My Stack — check for alerts.
+    if (n > 0) await queue.add("alerts", {}, { removeOnComplete: true, jobId: `alerts-after-${source.id}` });
     return { ingested: n };
   },
   // Concurrency >1 so the quick jobs (geo, news, ingest) aren't blocked behind

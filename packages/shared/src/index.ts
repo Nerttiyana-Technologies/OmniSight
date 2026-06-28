@@ -9,6 +9,22 @@ import { z } from "zod";
 export const SIGNAL_TYPES = ["vulnerability", "indicator", "actor", "advisory"] as const;
 export type SignalType = (typeof SIGNAL_TYPES)[number];
 
+export const ROLES = ["viewer", "analyst", "admin"] as const;
+export type Role = (typeof ROLES)[number];
+const ROLE_RANK: Record<Role, number> = { viewer: 1, analyst: 2, admin: 3 };
+
+/** True if `role` is at least the `min` role in the hierarchy viewer<analyst<admin. */
+export function roleAtLeast(role: string, min: Role): boolean {
+  return (ROLE_RANK[role as Role] ?? 0) >= ROLE_RANK[min];
+}
+
+export interface User {
+  id: string;
+  username: string;
+  role: Role;
+  createdAt: string;
+}
+
 /** A feed/source the platform ingests from. Admin-manageable at runtime. */
 export const SourceSchema = z.object({
   id: z.string(), // slug, e.g. "cisa-kev"
@@ -19,6 +35,7 @@ export const SourceSchema = z.object({
   schedule: z.string().default("0 */6 * * *"), // cron
   enabled: z.boolean().default(true),
   requiresAuth: z.boolean().default(false),
+  reliability: z.enum(["A", "B", "C", "D", "F"]).default("C"), // admiralty-style source grade
   config: z.record(z.unknown()).default({}),
 });
 export type Source = z.infer<typeof SourceSchema>;
@@ -221,6 +238,74 @@ export function indicatorsToBlocklist(items: Indicator[]): string {
   return lines.join("\n");
 }
 
+// --- IOC extractor / parser ------------------------------------------------
+
+export interface ExtractedIocs {
+  ips: string[];
+  domains: string[];
+  urls: string[];
+  hashes: string[];
+  cves: string[];
+}
+
+/** Undo common defanging: 1[.]2 -> 1.2, hxxp -> http, [@] -> @, etc. */
+export function refang(text: string): string {
+  return text
+    .replace(/\[\s*\.\s*\]|\(\s*\.\s*\)|\{\s*\.\s*\}|\[dot\]/gi, ".")
+    .replace(/\[\s*:\s*\]/g, ":")
+    .replace(/\[\s*\/\s*\]/g, "/")
+    .replace(/\[\s*@\s*\]|\(at\)|\[at\]/gi, "@")
+    .replace(/h\s*x\s*x\s*p(s?)\s*(?::|\[:\])\/\//gi, "http$1://")
+    .replace(/\bfxp\b/gi, "ftp");
+}
+
+/** Defang for safe display/sharing: 1.2.3.4 -> 1[.]2[.]3[.]4, http -> hxxp. */
+export function defang(value: string): string {
+  return value.replace(/^https?/i, (m) => `hxxp${m.slice(4)}`).replace(/\./g, "[.]");
+}
+
+const FILE_TLDS = new Set([
+  "exe", "dll", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "zip", "rar", "html",
+  "htm", "txt", "png", "jpg", "jpeg", "gif", "json", "xml", "csv", "js", "py", "sh", "bin", "dat", "log",
+]);
+
+function validOctet(s: string): boolean {
+  const n = Number(s);
+  return n >= 0 && n <= 255;
+}
+
+function uniqSorted(arr: string[]): string[] {
+  return [...new Set(arr)].sort();
+}
+
+export function extractIocs(text: string): ExtractedIocs {
+  const t = refang(text);
+  const cves = uniqSorted((t.match(/CVE-\d{4}-\d{4,}/gi) ?? []).map((s) => s.toUpperCase()));
+  const urls = uniqSorted(t.match(/\bhttps?:\/\/[^\s"'<>()\][]+/gi) ?? []);
+  const hashes = uniqSorted(
+    [
+      ...(t.match(/\b[A-Fa-f0-9]{64}\b/g) ?? []),
+      ...(t.match(/\b[A-Fa-f0-9]{40}\b/g) ?? []),
+      ...(t.match(/\b[A-Fa-f0-9]{32}\b/g) ?? []),
+    ].map((s) => s.toLowerCase()),
+  );
+  const ips = uniqSorted(
+    (t.match(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g) ?? []).filter((ip) => ip.split(".").every(validOctet)),
+  );
+  const ipSet = new Set(ips);
+  const noUrls = t.replace(/\bhttps?:\/\/[^\s"'<>()\][]+/gi, " ");
+  const domains = uniqSorted(
+    (noUrls.match(/\b(?:[a-z0-9-]+\.)+[a-z]{2,24}\b/gi) ?? [])
+      .map((s) => s.toLowerCase())
+      .filter((d) => {
+        if (ipSet.has(d)) return false;
+        const tld = d.split(".").pop() ?? "";
+        return !FILE_TLDS.has(tld);
+      }),
+  );
+  return { ips, domains, urls, hashes, cves };
+}
+
 function yamlStr(v: string): string {
   return `'${v.replace(/'/g, "''")}'`;
 }
@@ -266,6 +351,80 @@ export function indicatorsToSigma(items: Indicator[]): string {
   rule("OmniSight - Malicious URLs", "category: proxy", "c-uri", urls, "URLs flagged by OmniSight threat intelligence");
   rule("OmniSight - Known Malicious File Hashes", "category: file_event", "Hashes", hashes, "File hashes flagged by OmniSight threat intelligence");
   return docs.join("\n---\n") + "\n";
+}
+
+/** YARA rules: one network-IOC string rule + one file-hash rule. */
+export function indicatorsToYara(items: Indicator[]): string {
+  const net: string[] = [];
+  const hashes: string[] = [];
+  for (const i of items) {
+    if (i.type === "ip") net.push(ipOnly(i.value));
+    else if (i.type === "domain" || i.type === "url") net.push(i.value);
+    else if (i.type === "hash") hashes.push(i.value.toLowerCase());
+  }
+  const uniqNet = [...new Set(net)].slice(0, 5000);
+  const uniqHash = [...new Set(hashes)].slice(0, 5000);
+  const blocks: string[] = [];
+  if (uniqNet.length) {
+    const strings = uniqNet.map((v, idx) => `        $n${idx} = ${JSON.stringify(v)} ascii wide nocase`).join("\n");
+    blocks.push(`rule OmniSight_Network_IOCs\n{\n    meta:\n        description = "Network IOCs flagged by OmniSight"\n    strings:\n${strings}\n    condition:\n        any of them\n}`);
+  }
+  if (uniqHash.length) {
+    const conds = uniqHash.map((h) => {
+      const fn = h.length === 32 ? "md5" : h.length === 40 ? "sha1" : "sha256";
+      return `        hash.${fn}(0, filesize) == "${h}"`;
+    }).join(" or\n");
+    blocks.push(`rule OmniSight_File_Hashes\n{\n    meta:\n        description = "Malicious file hashes flagged by OmniSight"\n    condition:\n${conds}\n}`);
+  }
+  const header = uniqHash.length ? `import "hash"\n\n` : "";
+  return header + blocks.join("\n\n") + "\n";
+}
+
+function snortContent(s: string): string {
+  return s.replace(/[";\\]/g, "");
+}
+
+/** Suricata/Snort alert rules for network IOCs (sids from 1000001). */
+export function indicatorsToSnort(items: Indicator[]): string {
+  let sid = 1000001;
+  const lines = ["# OmniSight Suricata/Snort ruleset", `# generated ${new Date().toISOString()}`];
+  for (const i of items) {
+    if (sid > 1010000) break; // cap
+    if (i.type === "ip") {
+      const ip = ipOnly(i.value);
+      lines.push(`alert ip any any -> ${ip} any (msg:"OmniSight malicious IP ${ip}"; sid:${sid++}; rev:1;)`);
+    } else if (i.type === "domain") {
+      lines.push(`alert dns any any -> any any (msg:"OmniSight malicious domain"; dns.query; content:"${snortContent(i.value)}"; nocase; sid:${sid++}; rev:1;)`);
+    } else if (i.type === "url") {
+      try {
+        const u = new URL(i.value);
+        const path = snortContent(u.pathname + u.search) || "/";
+        lines.push(`alert http any any -> any any (msg:"OmniSight malicious URL ${snortContent(u.hostname)}"; http.host; content:"${snortContent(u.hostname)}"; nocase; http.uri; content:"${path}"; sid:${sid++}; rev:1;)`);
+      } catch { /* skip malformed URL */ }
+    }
+  }
+  return lines.join("\n") + "\n";
+}
+
+/** Parse a STIX 2.1 bundle's indicator patterns back into IOC value+type pairs. */
+export function parseStixIndicators(bundle: unknown): { value: string; type: IndicatorType; name: string | null; tags: string[] }[] {
+  const objects = ((bundle as { objects?: unknown[] }).objects ?? []) as {
+    type?: string; pattern?: string; name?: string; labels?: string[];
+  }[];
+  const out: { value: string; type: IndicatorType; name: string | null; tags: string[] }[] = [];
+  for (const o of objects) {
+    if (o.type !== "indicator" || !o.pattern) continue;
+    const p = o.pattern;
+    let m: RegExpMatchArray | null;
+    let value: string | null = null;
+    let type: IndicatorType | null = null;
+    if ((m = p.match(/ipv4-addr:value\s*=\s*'([^']+)'/))) { value = m[1]!; type = "ip"; }
+    else if ((m = p.match(/domain-name:value\s*=\s*'([^']+)'/))) { value = m[1]!; type = "domain"; }
+    else if ((m = p.match(/url:value\s*=\s*'([^']+)'/))) { value = m[1]!; type = "url"; }
+    else if ((m = p.match(/file:hashes\.[^=]*=\s*'([^']+)'/))) { value = m[1]!; type = "hash"; }
+    if (value && type) out.push({ value, type, name: o.name ?? null, tags: o.labels ?? [] });
+  }
+  return out;
 }
 
 // --- Daily brief / digest --------------------------------------------------

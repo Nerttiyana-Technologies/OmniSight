@@ -3,13 +3,17 @@ import { fileURLToPath } from "node:url";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import {
-  NewSourceSchema, SourceSchema, type Source,
+  NewSourceSchema, SourceSchema, IndicatorSchema, type Source, type Indicator,
   vulnerabilitiesToCsv, indicatorsToCsv, indicatorsToStix, indicatorsToBlocklist, indicatorsToSigma,
+  indicatorsToYara, indicatorsToSnort, parseStixIndicators,
 } from "@omnisight/shared";
 import { createRepository, composeDigest } from "@omnisight/db";
+import { roleAtLeast, type Role } from "@omnisight/shared";
+import { hashPassword, verifyPassword, signJwt, verifyJwt, type TokenPayload } from "./auth.js";
+import { llmConfigured, llmChat, coerceVulnFilters } from "./llm.js";
 import {
   cisaKevConnector, resolveConnector, resolveIndicatorConnector, resolveAdvisoryConnector,
-  seedSources, fetchEpss,
+  seedSources, fetchEpss, enrichIoc, parseSbom, queryOsvBatch,
 } from "@omnisight/connectors";
 
 // Load the repo-root .env (pnpm runs scripts from the package dir, so resolve up).
@@ -19,11 +23,39 @@ if (existsSync(envFile) && typeof process.loadEnvFile === "function") process.lo
 const repo = createRepository();
 const usingPostgres = Boolean(process.env.DATABASE_URL);
 
+// --- Auth config (opt-in) ---
+const AUTH_ENABLED = process.env.AUTH_ENABLED === "true";
+const JWT_SECRET = process.env.JWT_SECRET?.trim() || "";
+const JWT_TTL_HOURS = Number(process.env.JWT_EXPIRY_HOURS ?? 12);
+
+// --- SSO / OIDC (optional; generic authorization-code flow) ---
+const OIDC_AUTH_URL = process.env.OIDC_AUTH_URL?.trim() || "";
+const OIDC_TOKEN_URL = process.env.OIDC_TOKEN_URL?.trim() || "";
+const OIDC_USERINFO_URL = process.env.OIDC_USERINFO_URL?.trim() || "";
+const OIDC_CLIENT_ID = process.env.OIDC_CLIENT_ID?.trim() || "";
+const OIDC_CLIENT_SECRET = process.env.OIDC_CLIENT_SECRET?.trim() || "";
+const OIDC_REDIRECT_URI = process.env.OIDC_REDIRECT_URI?.trim() || "";
+const OIDC_SCOPE = process.env.OIDC_SCOPE?.trim() || "openid email profile";
+const SSO_LABEL = process.env.OIDC_LABEL?.trim() || "SSO";
+const APP_URL = process.env.APP_URL?.trim() || "http://localhost:5173";
+const SSO_ENABLED = AUTH_ENABLED && Boolean(OIDC_AUTH_URL && OIDC_TOKEN_URL && OIDC_USERINFO_URL && OIDC_CLIENT_ID && OIDC_REDIRECT_URI);
+
 async function bootstrap() {
   await repo.init();
 
   // Seed source registry.
   for (const s of seedSources) await repo.upsertSource(s);
+
+  // Seed an initial admin user when auth is on and no users exist.
+  if (AUTH_ENABLED) {
+    if (!JWT_SECRET) app.log.warn("AUTH_ENABLED but JWT_SECRET is not set — logins will fail. Set JWT_SECRET.");
+    if ((await repo.countUsers()) === 0) {
+      const u = process.env.ADMIN_USER?.trim() || "admin";
+      const p = process.env.ADMIN_PASS?.trim();
+      if (p) { await repo.createUser(u, hashPassword(p), "admin"); app.log.info(`seeded admin user '${u}'`); }
+      else app.log.warn("AUTH_ENABLED with no users — set ADMIN_USER/ADMIN_PASS to seed an admin account");
+    }
+  }
 
   // Zero-dependency demo: with no Postgres, seed the in-memory store from the
   // bundled CISA KEV fixture so the dashboard has data on first load.
@@ -45,8 +77,166 @@ async function bootstrap() {
   }
 }
 
-const app = Fastify({ logger: true });
+const app = Fastify({ logger: true, bodyLimit: 20 * 1024 * 1024 }); // SBOMs can be large
 await app.register(cors, { origin: true });
+
+// --- Auth + RBAC gate (only active when AUTH_ENABLED) ---
+app.addHook("onRequest", async (req, reply) => {
+  if (!AUTH_ENABLED) return;
+  const url = (req.raw.url ?? "").split("?")[0];
+  if (url === "/health" || url === "/api/auth/login" || url === "/api/auth/config") return;
+  if (url === "/api/auth/sso/login" || url === "/api/auth/sso/callback") return;
+
+  let token = "";
+  const authz = req.headers.authorization;
+  if (authz?.startsWith("Bearer ")) token = authz.slice(7);
+  else if (url === "/api/stream") token = (req.query as { token?: string }).token ?? ""; // EventSource can't set headers
+
+  const user = JWT_SECRET ? verifyJwt(token, JWT_SECRET) : null;
+  if (!user) return reply.status(401).send({ error: "unauthorized" });
+  (req as { user?: TokenPayload }).user = user;
+
+  const write = !["GET", "HEAD", "OPTIONS"].includes(req.method);
+  const isAdminPath = url.startsWith("/api/users") || url.startsWith("/api/audit") || (url.startsWith("/api/sources") && write && !url.endsWith("/run"));
+  if (isAdminPath && !roleAtLeast(user.role, "admin")) return reply.status(403).send({ error: "admin role required" });
+  // /api/ai/* is read-only analysis — viewers may use it.
+  if (write && !url.startsWith("/api/ai/") && !roleAtLeast(user.role, "analyst")) return reply.status(403).send({ error: "analyst role required" });
+});
+
+// --- Audit log: record mutating actions (and logins) when auth is enabled ---
+app.addHook("onResponse", async (req, reply) => {
+  if (!AUTH_ENABLED) return;
+  const url = (req.raw.url ?? "").split("?")[0];
+  const write = !["GET", "HEAD", "OPTIONS"].includes(req.method);
+  const isLogin = url === "/api/auth/login";
+  if (!write && !isLogin) return;
+  if (url.startsWith("/api/ai/")) return; // read-only analysis, skip noise
+  const u = (req as { user?: TokenPayload }).user;
+  const action = isLogin ? (reply.statusCode < 400 ? "login.success" : "login.failure") : `${req.method} ${url}`;
+  try {
+    await repo.appendAudit({
+      user: u?.username ?? (isLogin ? ((req.body as { username?: string })?.username ?? null) : null),
+      role: u?.role ?? null,
+      action,
+      method: req.method,
+      path: url,
+      status: reply.statusCode,
+    });
+  } catch (e) {
+    app.log.warn({ err: e }, "audit append failed");
+  }
+});
+
+app.get("/api/auth/config", async () => ({ authEnabled: AUTH_ENABLED, sso: SSO_ENABLED, ssoLabel: SSO_LABEL }));
+
+// --- Audit log (admin) ---
+app.get("/api/audit", async () => repo.listAudit(300));
+
+app.post("/api/auth/login", async (req, reply) => {
+  if (!AUTH_ENABLED) return reply.status(400).send({ error: "auth is disabled" });
+  const { username, password } = (req.body ?? {}) as { username?: string; password?: string };
+  if (!username || !password) return reply.status(400).send({ error: "username and password required" });
+  const rec = await repo.getUserByUsername(username);
+  if (!rec || !verifyPassword(password, rec.passwordHash)) return reply.status(401).send({ error: "invalid credentials" });
+  const token = signJwt({ sub: rec.id, username: rec.username, role: rec.role }, JWT_SECRET, JWT_TTL_HOURS);
+  return { token, user: { id: rec.id, username: rec.username, role: rec.role } };
+});
+
+// --- SSO / OIDC (generic authorization-code flow; auto-provisions viewers) ---
+const ssoStates = new Map<string, number>(); // state -> expiry (ms)
+function newState(): string {
+  const s = (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`).replace(/-/g, "");
+  ssoStates.set(s, Date.now() + 10 * 60_000);
+  return s;
+}
+function takeState(s: string): boolean {
+  const exp = ssoStates.get(s);
+  ssoStates.delete(s);
+  // prune
+  const now = Date.now();
+  for (const [k, v] of ssoStates) if (v < now) ssoStates.delete(k);
+  return Boolean(exp && exp > now);
+}
+
+app.get("/api/auth/sso/login", async (req, reply) => {
+  if (!SSO_ENABLED) return reply.status(400).send({ error: "SSO not configured" });
+  const state = newState();
+  const u = new URL(OIDC_AUTH_URL);
+  u.searchParams.set("response_type", "code");
+  u.searchParams.set("client_id", OIDC_CLIENT_ID);
+  u.searchParams.set("redirect_uri", OIDC_REDIRECT_URI);
+  u.searchParams.set("scope", OIDC_SCOPE);
+  u.searchParams.set("state", state);
+  return reply.redirect(u.toString());
+});
+
+app.get("/api/auth/sso/callback", async (req, reply) => {
+  if (!SSO_ENABLED) return reply.status(400).send({ error: "SSO not configured" });
+  const { code, state } = (req.query ?? {}) as { code?: string; state?: string };
+  if (!code || !state || !takeState(state)) return reply.redirect(`${APP_URL}/#sso_error=invalid_state`);
+  try {
+    // 1) Exchange the authorization code for tokens.
+    const tokenRes = await fetch(OIDC_TOKEN_URL, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: OIDC_REDIRECT_URI,
+        client_id: OIDC_CLIENT_ID,
+        ...(OIDC_CLIENT_SECRET ? { client_secret: OIDC_CLIENT_SECRET } : {}),
+      }),
+    });
+    if (!tokenRes.ok) throw new Error(`token endpoint HTTP ${tokenRes.status}`);
+    const tokens = (await tokenRes.json()) as { access_token?: string };
+    if (!tokens.access_token) throw new Error("no access_token");
+
+    // 2) Fetch the user profile.
+    const infoRes = await fetch(OIDC_USERINFO_URL, { headers: { authorization: `Bearer ${tokens.access_token}` } });
+    if (!infoRes.ok) throw new Error(`userinfo HTTP ${infoRes.status}`);
+    const info = (await infoRes.json()) as { email?: string; preferred_username?: string; sub?: string };
+    const username = (info.email || info.preferred_username || info.sub || "").trim();
+    if (!username) throw new Error("no identity in userinfo");
+
+    // 3) Find or auto-provision (as viewer) the local user, then issue a JWT.
+    let rec = await repo.getUserByUsername(username);
+    if (!rec) {
+      const created = await repo.createUser(username, hashPassword(globalThis.crypto.randomUUID()), "viewer");
+      rec = { ...created, passwordHash: "" };
+    }
+    const token = signJwt({ sub: rec.id, username: rec.username, role: rec.role }, JWT_SECRET, JWT_TTL_HOURS);
+    await repo.appendAudit({ user: rec.username, role: rec.role, action: "login.sso", method: "GET", path: "/api/auth/sso/callback", status: 200 });
+    return reply.redirect(`${APP_URL}/#sso_token=${encodeURIComponent(token)}`);
+  } catch (e) {
+    app.log.warn({ err: e }, "SSO callback failed");
+    return reply.redirect(`${APP_URL}/#sso_error=${encodeURIComponent((e as Error).message)}`);
+  }
+});
+
+app.get("/api/auth/me", async (req) => {
+  const u = (req as { user?: TokenPayload }).user;
+  return { authEnabled: AUTH_ENABLED, user: u ? { id: u.sub, username: u.username, role: u.role } : null };
+});
+
+// --- User management (admin) ---
+app.get("/api/users", async () => repo.listUsers());
+app.post("/api/users", async (req, reply) => {
+  const b = (req.body ?? {}) as { username?: string; password?: string; role?: string };
+  if (!b.username || !b.password) return reply.status(400).send({ error: "username and password required" });
+  if (await repo.getUserByUsername(b.username)) return reply.status(409).send({ error: "username already exists" });
+  const role: Role = ["viewer", "analyst", "admin"].includes(b.role ?? "") ? (b.role as Role) : "viewer";
+  return repo.createUser(b.username, hashPassword(b.password), role);
+});
+app.patch("/api/users/:id", async (req, reply) => {
+  const role = (req.body as { role?: string }).role;
+  if (!["viewer", "analyst", "admin"].includes(role ?? "")) return reply.status(400).send({ error: "invalid role" });
+  await repo.setUserRole((req.params as { id: string }).id, role as Role);
+  return { ok: true };
+});
+app.delete("/api/users/:id", async (req) => {
+  await repo.deleteUser((req.params as { id: string }).id);
+  return { ok: true };
+});
 
 // --- Server-Sent Events: push an "update" the instant data changes ---
 const sseClients = new Set<import("node:http").ServerResponse>();
@@ -86,6 +276,98 @@ app.get("/api/stats", async () => repo.stats());
 app.get("/api/map", async () => repo.mapData());
 
 app.get("/api/correlations", async () => repo.cveCorrelations(50));
+
+app.get("/api/attack", async () => repo.attackTechniques(60));
+
+// --- Actor / campaign profiles ---
+app.get("/api/actors", async () => repo.actorProfiles(80));
+app.get("/api/actors/:name", async (req, reply) => {
+  const name = decodeURIComponent((req.params as { name: string }).name);
+  const profile = await repo.actorProfile(name);
+  if (!profile) return reply.status(404).send({ error: "not found" });
+  return profile;
+});
+
+// --- AI layer (optional LLM) ---
+app.get("/api/ai/config", async () => ({ enabled: llmConfigured() }));
+
+app.post("/api/ai/summarize", async (req, reply) => {
+  const { text } = (req.body ?? {}) as { text?: string };
+  if (!text?.trim()) return reply.status(400).send({ error: "text required" });
+  if (!llmConfigured()) return reply.status(400).send({ error: "AI not configured (set LLM_BASE_URL)" });
+  try {
+    const summary = await llmChat(
+      "You are a concise cyber threat analyst. In 2–3 sentences for a SOC analyst, summarize: what this is, who/what is affected, and the recommended action. No preamble.",
+      text.slice(0, 6000),
+    );
+    return { summary };
+  } catch (e) {
+    return reply.status(502).send({ error: (e as Error).message });
+  }
+});
+
+app.post("/api/ai/query", async (req, reply) => {
+  const { q } = (req.body ?? {}) as { q?: string };
+  if (!q?.trim()) return reply.status(400).send({ error: "q required" });
+  if (!llmConfigured()) return reply.status(400).send({ error: "AI not configured (set LLM_BASE_URL)" });
+  const sys =
+    'Translate the user request into JSON filters for a vulnerability search. ' +
+    'Output ONLY a JSON object with optional keys: minRisk (0-100 number), q (keyword string), ' +
+    'vendor (string), exploited (boolean), ransomware (boolean), sort ("risk"|"cvss"|"epss"|"reported"), dir ("asc"|"desc"). ' +
+    'Example: {"vendor":"cisco","exploited":true,"sort":"risk","dir":"desc"}';
+  try {
+    const raw = await llmChat(sys, q.slice(0, 500), { json: true });
+    let parsed: unknown = {};
+    try { parsed = JSON.parse(raw); } catch { /* model returned non-JSON */ }
+    const filters = coerceVulnFilters(parsed);
+    const { items, total } = await repo.page({ ...filters, limit: 25 });
+    return { filters, items, total };
+  } catch (e) {
+    return reply.status(502).send({ error: (e as Error).message });
+  }
+});
+
+app.post("/api/import/stix", async (req, reply) => {
+  const parsed = parseStixIndicators(req.body);
+  if (parsed.length === 0) return reply.status(400).send({ error: "No STIX indicator patterns found." });
+  await repo.upsertSource(SourceSchema.parse({
+    id: "stix-import", name: "Imported (STIX)", kind: "json", signalType: "indicator",
+    url: null, schedule: "0 0 * * *", enabled: false, requiresAuth: false, reliability: "C", config: {},
+  }));
+  const now = new Date().toISOString();
+  const items: Indicator[] = parsed.map((p) => IndicatorSchema.parse({
+    id: p.value, source: "stix-import", type: p.type, value: p.value,
+    malware: p.name, threatType: null, confidence: null, references: [], tags: p.tags,
+    firstSeen: null, lastSeen: now, country: null, countryCode: null, lat: null, lng: null, fetchedAt: now,
+  }));
+  const n = await repo.upsertIndicators(items);
+  await repo.signalChange("stix-import");
+  return { imported: n };
+});
+
+app.post("/api/sbom", async (req, reply) => {
+  const comps = parseSbom(req.body);
+  if (comps.length === 0) return reply.status(400).send({ error: "No purl-bearing components found (CycloneDX or SPDX with purls)." });
+  try {
+    const results = await queryOsvBatch(comps);
+    return {
+      total: results.length,
+      vulnerable: results.filter((r) => r.vulns.length > 0).length,
+      components: results.sort((a, b) => b.vulns.length - a.vulns.length),
+    };
+  } catch (e) {
+    return reply.status(502).send({ error: (e as Error).message });
+  }
+});
+
+app.get("/api/enrich/ioc", async (req, reply) => {
+  const q = req.query as { value?: string; type?: string };
+  if (!q.value) return reply.status(400).send({ error: "value required" });
+  return enrichIoc(q.value, q.type ?? "ip", {
+    greynoiseKey: process.env.GREYNOISE_API_KEY?.trim() || undefined,
+    abuseKey: process.env.ABUSEIPDB_API_KEY?.trim() || undefined,
+  });
+});
 
 app.get("/api/map/indicators", async (req) => {
   const code = (req.query as { code?: string }).code;
@@ -175,6 +457,18 @@ app.get("/api/indicators/export", async (req, reply) => {
       .header("content-disposition", 'attachment; filename="omnisight-sigma.yml"')
       .send(indicatorsToSigma(items));
   }
+  if (format === "yara") {
+    return reply
+      .header("content-type", "text/plain; charset=utf-8")
+      .header("content-disposition", 'attachment; filename="omnisight.yar"')
+      .send(indicatorsToYara(items));
+  }
+  if (format === "snort") {
+    return reply
+      .header("content-type", "text/plain; charset=utf-8")
+      .header("content-disposition", 'attachment; filename="omnisight.rules"')
+      .send(indicatorsToSnort(items));
+  }
   return reply
     .header("content-type", "text/csv; charset=utf-8")
     .header("content-disposition", 'attachment; filename="omnisight-indicators.csv"')
@@ -193,6 +487,7 @@ app.get("/api/indicators", async (req) => {
     q: q.q || undefined,
     source: q.source || undefined,
     sort: q.sort || undefined,
+    maxAgeDays: q.maxAgeDays ? Number(q.maxAgeDays) : undefined,
     dir: q.dir === "asc" ? "asc" : q.dir === "desc" ? "desc" : undefined,
   });
   return { ...result, page, pageSize };
@@ -227,6 +522,23 @@ app.get("/api/advisories", async (req) => {
     q: q.q || undefined,
   });
   return { ...result, page, pageSize };
+});
+
+// --- Investigation notes (TLP) ---
+app.get("/api/notes", async (req, reply) => {
+  const ref = (req.query as { ref?: string }).ref;
+  if (!ref) return reply.status(400).send({ error: "ref required" });
+  return repo.listNotes(ref);
+});
+app.post("/api/notes", async (req, reply) => {
+  const b = req.body as { ref?: string; tlp?: string; body?: string };
+  if (!b.ref || !b.body?.trim()) return reply.status(400).send({ error: "ref and body required" });
+  const tlp = ["clear", "green", "amber", "red"].includes(b.tlp ?? "") ? b.tlp! : "amber";
+  return repo.addNote(b.ref, tlp, b.body.trim());
+});
+app.delete("/api/notes/:id", async (req) => {
+  await repo.deleteNote((req.params as { id: string }).id);
+  return { ok: true };
 });
 
 app.get("/api/sources", async () => repo.listSources());

@@ -20,6 +20,8 @@ export {
   fetchEpss, parseEpss, fetchNvdCvss, extractCvss, cvssFromMetrics, sleep,
   fetchGeo, parseGeo, type EpssResult, type GeoResult,
 } from "./enrichers.js";
+export { enrichIoc, parseShodan, parseGreynoise, parseAbuse, type IocEnrichment } from "./enrich-ioc.js";
+export { parseSbom, parsePurl, queryOsvBatch, type SbomComponent, type SbomResult } from "./sbom.js";
 
 /** Built-in vulnerability connectors, keyed by source slug. */
 export const builtinConnectors: Record<string, Connector> = {
@@ -63,7 +65,7 @@ export function resolveConnector(source: Source): Connector {
 }
 
 /** Source rows seeded on first boot so the dashboard has data immediately. */
-export const seedSources: Source[] = [
+const seedSourcesRaw: Omit<Source, "reliability">[] = [
   {
     id: "cisa-kev",
     name: "CISA Known Exploited Vulnerabilities",
@@ -153,3 +155,15 @@ export const seedSources: Source[] = [
     config: {},
   },
 ];
+
+// Admiralty-style source grades: A authoritative · B usually reliable · C fairly.
+const SEED_RELIABILITY: Record<string, Source["reliability"]> = {
+  "cisa-kev": "A", nvd: "A", "mitre-atlas": "A",
+  threatfox: "B", otx: "C",
+  "securityweek-ai": "C", thehackernews: "C", darkreading: "C",
+};
+
+export const seedSources: Source[] = seedSourcesRaw.map((s) => ({
+  ...s,
+  reliability: SEED_RELIABILITY[s.id] ?? "C",
+}));
