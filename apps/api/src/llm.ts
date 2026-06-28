@@ -1,27 +1,34 @@
 // Configurable LLM client — works with any OpenAI-compatible endpoint,
 // including Ollama (LLM_BASE_URL=http://localhost:11434/v1, no key needed).
 
-const LLM_BASE = process.env.LLM_BASE_URL?.trim().replace(/\/$/, "");
-const LLM_KEY = process.env.LLM_API_KEY?.trim();
-const LLM_MODEL = process.env.LLM_MODEL?.trim() || "llama3.1";
+// Read config lazily (at call time), NOT at module load — the API loads its
+// .env file during startup, which happens after this module is first imported.
+function llmConfig() {
+  return {
+    base: process.env.LLM_BASE_URL?.trim().replace(/\/$/, "") || "",
+    key: process.env.LLM_API_KEY?.trim() || "",
+    model: process.env.LLM_MODEL?.trim() || "llama3.1",
+  };
+}
 
 export function llmConfigured(): boolean {
-  return Boolean(LLM_BASE);
+  return Boolean(llmConfig().base);
 }
 
 interface ChatChoice { message?: { content?: string } }
 interface ChatResponse { choices?: ChatChoice[] }
 
 export async function llmChat(system: string, user: string, opts: { json?: boolean } = {}): Promise<string> {
-  if (!LLM_BASE) throw new Error("LLM not configured (set LLM_BASE_URL)");
-  const res = await fetch(`${LLM_BASE}/chat/completions`, {
+  const { base, key, model } = llmConfig();
+  if (!base) throw new Error("LLM not configured (set LLM_BASE_URL)");
+  const res = await fetch(`${base}/chat/completions`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      ...(LLM_KEY ? { authorization: `Bearer ${LLM_KEY}` } : {}),
+      ...(key ? { authorization: `Bearer ${key}` } : {}),
     },
     body: JSON.stringify({
-      model: LLM_MODEL,
+      model,
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },

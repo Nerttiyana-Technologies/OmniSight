@@ -613,7 +613,7 @@ export class InMemoryRepository implements Repository {
     if (opts.vendor) {
       const vq = opts.vendor.toLowerCase();
       rows = rows.filter(
-        (v) => (v.vendor ?? "").toLowerCase().includes(vq) || (v.product ?? "").toLowerCase().includes(vq),
+        (v) => (v.vendor ?? "").toLowerCase().includes(vq) || (v.product ?? "").toLowerCase().includes(vq) || v.title.toLowerCase().includes(vq),
       );
     }
     if (opts.q) {
@@ -948,8 +948,10 @@ export class PostgresRepository implements Repository {
     if (opts.exploited) where.push(`known_exploited = TRUE`);
     if (opts.ransomware) where.push(`ransomware_use = TRUE`);
     if (opts.vendor) {
+      // Match the title too: NVD CVEs often carry the vendor name only in the
+      // title (the vendor column is null), so a column-only filter misses them.
       params.push(`%${opts.vendor}%`);
-      where.push(`(vendor ILIKE $${params.length} OR product ILIKE $${params.length})`);
+      where.push(`(vendor ILIKE $${params.length} OR product ILIKE $${params.length} OR title ILIKE $${params.length})`);
     }
     if (opts.terms && opts.terms.length) {
       const ors = opts.terms.map((t) => {
