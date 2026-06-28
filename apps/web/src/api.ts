@@ -179,6 +179,22 @@ export interface AiLink {
   rationale: string;
 }
 
+export type Verdict = "confirmed" | "false_positive";
+
+export interface SavedSearch {
+  id: string;
+  name: string;
+  kind: "vuln" | "ioc";
+  params: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface TyposquatGroup {
+  brand: string;
+  seen: { value: string; source: string; malware: string | null }[];
+  candidates: string[];
+}
+
 export interface IocEnrichment {
   value: string;
   type: string;
@@ -308,6 +324,17 @@ export const api = {
     }).then(json<Source>),
   runSource: (id: string) =>
     af(`/api/sources/${id}/run`, { method: "POST" }).then(json<{ ingested: number }>),
+  setSourceEnabled: (id: string, enabled: boolean) =>
+    af(`/api/sources/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled }) }).then(json<{ ok: boolean }>),
+  deleteSource: (id: string) => af(`/api/sources/${encodeURIComponent(id)}`, { method: "DELETE" }).then(json<{ ok: boolean }>),
+  feedback: () => af("/api/feedback").then(json<Record<string, Verdict>>),
+  setFeedback: (ref: string, verdict: Verdict | null) =>
+    af("/api/feedback", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ref, verdict }) }).then(json<{ ok: boolean }>),
+  searches: () => af("/api/searches").then(json<SavedSearch[]>),
+  createSearch: (name: string, kind: "vuln" | "ioc", params: Record<string, unknown>) =>
+    af("/api/searches", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, kind, params }) }).then(json<SavedSearch>),
+  deleteSearch: (id: string) => af(`/api/searches/${id}`, { method: "DELETE" }).then(json<{ ok: boolean }>),
+  typosquat: () => af("/api/typosquat").then(json<TyposquatGroup[]>),
   indicators: (params: IndicatorQuery = {}) =>
     af(`/api/indicators?${iocQs(params)}`).then(json<IndicatorPage>),
   exportIndicatorUrl: (params: IndicatorQuery = {}, format = "csv") => {

@@ -37,6 +37,8 @@ export const SourceSchema = z.object({
   requiresAuth: z.boolean().default(false),
   reliability: z.enum(["A", "B", "C", "D", "F"]).default("C"), // admiralty-style source grade
   config: z.record(z.unknown()).default({}),
+  createdAt: z.string().nullable().optional(), // set by the store
+  lastRunAt: z.string().nullable().optional(),
 });
 export type Source = z.infer<typeof SourceSchema>;
 
@@ -467,6 +469,40 @@ export function normalizeHibpBreaches(raw: unknown, domain: string): Breach[] {
       verified: Boolean(b.IsVerified),
       fetchedAt,
     }));
+}
+
+// --- Typosquat / look-alike domain generation -------------------------------
+
+const HOMOGLYPHS: Record<string, string> = { o: "0", l: "1", i: "1", e: "3", a: "4", s: "5", g: "9", b: "6", t: "7" };
+const ALT_TLDS = ["com", "net", "org", "co", "io", "info", "xyz", "online", "app", "site", "live"];
+
+/**
+ * Generate common typosquat / look-alike permutations of a domain
+ * (omission, transposition, repetition, homoglyph, hyphenation, TLD swap).
+ * Pure and deterministic — used to seed brand-abuse monitoring.
+ */
+export function typosquatVariants(domain: string): string[] {
+  const d = domain.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+  const dot = d.indexOf(".");
+  if (dot <= 0) return [];
+  const name = d.slice(0, dot);
+  const tld = d.slice(dot + 1);
+  const out = new Set<string>();
+  const add = (n: string, t = tld) => { if (n && n.length > 1) out.add(`${n}.${t}`); };
+
+  for (let i = 0; i < name.length; i++) add(name.slice(0, i) + name.slice(i + 1));            // omission
+  for (let i = 0; i < name.length - 1; i++) {                                                  // transposition
+    const a = name.split(""); const t = a[i]!; a[i] = a[i + 1]!; a[i + 1] = t; add(a.join(""));
+  }
+  for (let i = 0; i < name.length; i++) add(name.slice(0, i + 1) + name[i] + name.slice(i + 1)); // repetition
+  for (let i = 0; i < name.length; i++) {                                                       // homoglyph
+    const h = HOMOGLYPHS[name[i]!]; if (h) add(name.slice(0, i) + h + name.slice(i + 1));
+  }
+  for (let i = 1; i < name.length; i++) add(name.slice(0, i) + "-" + name.slice(i));            // hyphenation
+  for (const t of ALT_TLDS) if (t !== tld) add(name, t);                                        // TLD swap
+
+  out.delete(d);
+  return [...out];
 }
 
 // --- Daily brief / digest --------------------------------------------------

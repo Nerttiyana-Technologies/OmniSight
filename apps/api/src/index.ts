@@ -5,7 +5,7 @@ import cors from "@fastify/cors";
 import {
   NewSourceSchema, SourceSchema, IndicatorSchema, type Source, type Indicator,
   vulnerabilitiesToCsv, indicatorsToCsv, indicatorsToStix, indicatorsToBlocklist, indicatorsToSigma,
-  indicatorsToYara, indicatorsToSnort, parseStixIndicators,
+  indicatorsToYara, indicatorsToSnort, parseStixIndicators, typosquatVariants,
 } from "@omnisight/shared";
 import { createRepository, composeDigest } from "@omnisight/db";
 import { roleAtLeast, type Role } from "@omnisight/shared";
@@ -304,6 +304,50 @@ app.post("/api/breaches/run", async (_req, reply) => {
   } catch (e) {
     return reply.status(502).send({ error: (e as Error).message });
   }
+});
+
+// --- Analyst feedback / verdicts ---
+app.get("/api/feedback", async () => repo.getFeedback());
+app.post("/api/feedback", async (req, reply) => {
+  const { ref, verdict } = (req.body ?? {}) as { ref?: string; verdict?: string | null };
+  if (!ref) return reply.status(400).send({ error: "ref required" });
+  if (verdict != null && verdict !== "confirmed" && verdict !== "false_positive") {
+    return reply.status(400).send({ error: "verdict must be confirmed | false_positive | null" });
+  }
+  await repo.setFeedback(ref, (verdict ?? null) as "confirmed" | "false_positive" | null);
+  await repo.signalChange("feedback");
+  return { ok: true };
+});
+
+// --- Saved searches ---
+app.get("/api/searches", async () => repo.listSavedSearches());
+app.post("/api/searches", async (req, reply) => {
+  const b = (req.body ?? {}) as { name?: string; kind?: string; params?: Record<string, unknown> };
+  if (!b.name?.trim()) return reply.status(400).send({ error: "name required" });
+  if (b.kind !== "vuln" && b.kind !== "ioc") return reply.status(400).send({ error: "kind must be vuln | ioc" });
+  return repo.createSavedSearch({ name: b.name.trim(), kind: b.kind, params: b.params ?? {} });
+});
+app.delete("/api/searches/:id", async (req) => {
+  await repo.deleteSavedSearch((req.params as { id: string }).id);
+  return { ok: true };
+});
+
+// --- Typosquat / look-alike domain monitoring ---
+app.get("/api/typosquat", async () => {
+  const terms = await repo.listWatchlist();
+  const domains = terms.filter((t) => /^[a-z0-9-]+\.[a-z]{2,}$/i.test(t.trim()));
+  const out: { brand: string; seen: { value: string; source: string; malware: string | null }[]; candidates: string[] }[] = [];
+  for (const brand of domains) {
+    const name = brand.slice(0, brand.indexOf("."));
+    // Look-alikes already in our intel: domain indicators containing the brand
+    // name but not the official domain itself.
+    const page = await repo.pageIndicators({ type: "domain", q: name, pageSize: 100 });
+    const seen = page.items
+      .filter((i) => i.value.toLowerCase() !== brand.toLowerCase() && i.value.toLowerCase().includes(name.toLowerCase()))
+      .map((i) => ({ value: i.value, source: i.source, malware: i.malware }));
+    out.push({ brand, seen, candidates: typosquatVariants(brand).slice(0, 40) });
+  }
+  return out;
 });
 
 // --- Automation rules (admin) ---
@@ -628,6 +672,24 @@ app.post("/api/sources", async (req, reply) => {
   const source: Source = SourceSchema.parse({ ...data, id });
   await repo.upsertSource(source);
   return reply.status(201).send(source);
+});
+
+/** Admin: enable/disable a source (takes effect on the worker's next schedule cycle). */
+app.patch("/api/sources/:id", async (req, reply) => {
+  const { enabled } = (req.body ?? {}) as { enabled?: boolean };
+  if (typeof enabled !== "boolean") return reply.status(400).send({ error: "enabled (boolean) required" });
+  await repo.setSourceEnabled((req.params as { id: string }).id, enabled);
+  return { ok: true };
+});
+
+/** Admin: delete a source and its ingested rows (cascade). */
+app.delete("/api/sources/:id", async (req, reply) => {
+  const id = (req.params as { id: string }).id;
+  const exists = (await repo.listSources()).some((s) => s.id === id);
+  if (!exists) return reply.status(404).send({ error: `source "${id}" not found` });
+  await repo.deleteSource(id);
+  await repo.signalChange("source-deleted");
+  return { ok: true };
 });
 
 /** Admin: trigger an immediate fetch for a source (otherwise it runs on schedule). */
