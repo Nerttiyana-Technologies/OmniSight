@@ -2,19 +2,20 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import {
   Radar, Moon, Sun, RefreshCw, Plus, ShieldAlert, Skull, Flame, Database, TrendingUp, Rss,
   Activity, Gauge, ChevronLeft, ChevronRight, Crosshair, Server, X, Download, FileText, Newspaper, ExternalLink,
+  ScanSearch, Copy, Package, LogOut, Users as UsersIcon, Lock, Trash2, Sparkles, ScrollText, Bug, KeyRound,
 } from "lucide-react";
 import {
-  riskBand, threatLevel, type Vulnerability, type Indicator, type Advisory, type NewSource, type Source,
-  type Digest, type DigestTone,
+  riskBand, threatLevel, extractIocs, defang, roleAtLeast, type Vulnerability, type Indicator, type Advisory, type NewSource, type Source,
+  type Digest, type DigestTone, type ExtractedIocs, type User,
 } from "@omnisight/shared";
 import {
-  api, type Stats, type VulnQuery, type IndicatorQuery, type AdvisoryQuery, type MapPoint, type MapIndicator,
-  type Correlation,
+  api, setToken, type Stats, type VulnQuery, type IndicatorQuery, type AdvisoryQuery, type MapPoint, type MapIndicator,
+  type Correlation, type AttackTechnique, type ActorProfile, type AuditEntry,
 } from "./api.ts";
 import { makeProjector, topologyToGeometries, geomToPath, type Geom } from "./geo.ts";
 
 type Theme = "dark" | "light";
-type Tab = "overview" | "vulns" | "iocs" | "news" | "map";
+type Tab = "overview" | "vulns" | "iocs" | "actors" | "news" | "map";
 
 function toneBadgeClass(tone?: DigestTone): string {
   return tone && tone !== "info" ? tone : "info";
@@ -52,6 +53,21 @@ function downloadBlob(filename: string, content: string, type: string) {
   URL.revokeObjectURL(url);
 }
 
+function reliabilityOf(sources: Source[], id: string): string | null {
+  return sources.find((s) => s.id === id)?.reliability ?? null;
+}
+function isStale(lastSeen: string | null, days = 90): boolean {
+  if (!lastSeen) return false;
+  return Date.now() - new Date(lastSeen).getTime() > days * 86400000;
+}
+function SourceCell({ source, reliability }: { source: string; reliability: string | null }) {
+  return (
+    <span>
+      {source}{reliability && <span className={`badge rel-${reliability}`} title={`Source reliability: ${reliability}`} style={{ marginLeft: 6 }}>{reliability}</span>}
+    </span>
+  );
+}
+
 /** Client-side "in my stack" check (mirrors the server's matching). */
 function inStack(v: Vulnerability, terms: string[]): boolean {
   if (!terms.length) return false;
@@ -67,12 +83,53 @@ export function App() {
   const [terms, setTerms] = useState<string[]>([]);
   const [showAdd, setShowAdd] = useState(false);
   const [showStack, setShowStack] = useState(false);
+  const [showExtract, setShowExtract] = useState(false);
+  const [showSbom, setShowSbom] = useState(false);
+  const [enrichTarget, setEnrichTarget] = useState<{ value: string; type: string } | null>(null);
+  const onEnrich = useCallback((value: string, type: string) => setEnrichTarget({ value, type }), []);
+  const [detailTarget, setDetailTarget] = useState<Vulnerability | null>(null);
+  const onDetail = useCallback((v: Vulnerability) => setDetailTarget(v), []);
   const [live, setLive] = useState(true);
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
 
+  // Auth
+  const [authEnabled, setAuthEnabled] = useState(false);
+  const [me, setMe] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [showUsers, setShowUsers] = useState(false);
+  const [showAudit, setShowAudit] = useState(false);
+
+  // AI
+  const [aiEnabled, setAiEnabled] = useState(false);
+  const [showAsk, setShowAsk] = useState(false);
+
   const REFRESH_MS = 15000;
   const bump = useCallback(() => setReloadKey((k) => k + 1), []);
+
+  const canWrite = !authEnabled || (me != null && roleAtLeast(me.role, "analyst"));
+  const isAdmin = !authEnabled || me?.role === "admin";
+
+  useEffect(() => {
+    api.aiConfig().then((c) => setAiEnabled(c.enabled)).catch(() => {});
+    // Capture an SSO token handed back in the URL fragment (#sso_token=...).
+    const hash = window.location.hash;
+    if (hash.includes("sso_token=")) {
+      const t = new URLSearchParams(hash.slice(1)).get("sso_token");
+      if (t) setToken(t);
+      history.replaceState(null, "", window.location.pathname + window.location.search);
+    }
+    api.authConfig().then((cfg) => {
+      setAuthEnabled(cfg.authEnabled);
+      if (!cfg.authEnabled) { setAuthReady(true); return; }
+      api.me().then((r) => { setMe(r.user); setAuthReady(true); }).catch(() => { setMe(null); setAuthReady(true); });
+    }).catch(() => setAuthReady(true));
+  }, []);
+
+  function logout() {
+    setToken(null);
+    setMe(null);
+  }
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -103,7 +160,11 @@ export function App() {
       startPolling();
     }
     return () => { es?.close(); if (poll) clearInterval(poll); };
-  }, [live, bump]);
+  }, [live, bump, me]);
+
+  if (authReady && authEnabled && !me) {
+    return <Login onLogin={(u) => { setMe(u); bump(); }} theme={theme} />;
+  }
 
   return (
     <>
@@ -116,6 +177,32 @@ export function App() {
           </div>
         </div>
         <div className="spacer" />
+        {authEnabled && me && (
+          <div className="user-chip" title={`Signed in as ${me.username}`}>
+            <span className="user-name">{me.username}</span>
+            <span className={`badge rel-${me.role === "admin" ? "A" : me.role === "analyst" ? "B" : "C"}`}>{me.role}</span>
+          </div>
+        )}
+        {aiEnabled && (
+          <button className="icon-btn" data-tooltip="Ask AI" aria-label="Ask AI" onClick={() => setShowAsk(true)}>
+            <Sparkles size={18} />
+          </button>
+        )}
+        {isAdmin && authEnabled && (
+          <button className="icon-btn" data-tooltip="Audit log" aria-label="Audit log" onClick={() => setShowAudit(true)}>
+            <ScrollText size={18} />
+          </button>
+        )}
+        {isAdmin && authEnabled && (
+          <button className="icon-btn" data-tooltip="Users" aria-label="Users" onClick={() => setShowUsers(true)}>
+            <UsersIcon size={18} />
+          </button>
+        )}
+        {authEnabled && me && (
+          <button className="icon-btn" data-tooltip="Sign out" aria-label="Sign out" onClick={logout}>
+            <LogOut size={18} />
+          </button>
+        )}
         <div className="live-status" title={live ? "Auto-refreshing" : "Auto-refresh paused"}>
           <span className={`live-dot ${live ? "on" : "off"}`} />
           <span className="live-text">
@@ -131,30 +218,54 @@ export function App() {
         >
           <Activity size={18} className={live ? "pulse" : ""} />
         </button>
+        {canWrite && (
+          <button
+            className="icon-btn"
+            data-tooltip="Fetch EPSS scores"
+            aria-label="Enrich with EPSS"
+            onClick={async () => { try { await api.enrich(); bump(); } catch { /* offline */ } }}
+          >
+            <Gauge size={18} />
+          </button>
+        )}
         <button
           className="icon-btn"
-          data-tooltip="Fetch EPSS scores"
-          aria-label="Enrich with EPSS"
-          onClick={async () => { try { await api.enrich(); bump(); } catch { /* offline */ } }}
+          data-tooltip="Extract IOCs from text"
+          aria-label="Extract IOCs"
+          onClick={() => setShowExtract(true)}
         >
-          <Gauge size={18} />
+          <ScanSearch size={18} />
         </button>
-        <button
-          className="icon-btn"
-          data-tooltip="My Stack"
-          aria-label="My Stack"
-          onClick={() => setShowStack((v) => !v)}
-        >
-          <Server size={18} />
-        </button>
-        <button
-          className="icon-btn"
-          data-tooltip="Add feed (admin)"
-          aria-label="Add feed"
-          onClick={() => setShowAdd((v) => !v)}
-        >
-          <Plus size={18} />
-        </button>
+        {canWrite && (
+          <button
+            className="icon-btn"
+            data-tooltip="Scan an SBOM (CycloneDX/SPDX)"
+            aria-label="Scan SBOM"
+            onClick={() => setShowSbom(true)}
+          >
+            <Package size={18} />
+          </button>
+        )}
+        {canWrite && (
+          <button
+            className="icon-btn"
+            data-tooltip="My Stack"
+            aria-label="My Stack"
+            onClick={() => setShowStack((v) => !v)}
+          >
+            <Server size={18} />
+          </button>
+        )}
+        {isAdmin && (
+          <button
+            className="icon-btn"
+            data-tooltip="Add feed (admin)"
+            aria-label="Add feed"
+            onClick={() => setShowAdd((v) => !v)}
+          >
+            <Plus size={18} />
+          </button>
+        )}
         <button className="icon-btn" data-tooltip="Refresh" aria-label="Refresh" onClick={bump}>
           <RefreshCw size={18} />
         </button>
@@ -172,7 +283,7 @@ export function App() {
         <section className="stat-grid">
           <StatCard icon={<Database size={16} />} label="Tracked" value={stats?.total} />
           <StatCard icon={<ShieldAlert size={16} />} label="Known Exploited" value={stats?.knownExploited} accent />
-          <StatCard icon={<Skull size={16} />} label="Ransomware-linked" value={stats?.ransomware} />
+          <StatCard icon={<Skull size={16} />} label="Ransomware" value={stats?.ransomware} />
           <StatCard icon={<Flame size={16} />} label="Critical (75+)" value={stats?.critical} crit />
           <StatCard icon={<TrendingUp size={16} />} label="High (50–74)" value={stats?.high} />
           <StatCard icon={<Crosshair size={16} />} label="Indicators" value={stats?.indicators} />
@@ -194,6 +305,9 @@ export function App() {
           <button className={`tab ${tab === "iocs" ? "active" : ""}`} onClick={() => setTab("iocs")}>
             Indicators {stats && <span className="muted">({stats.indicators.toLocaleString()})</span>}
           </button>
+          <button className={`tab ${tab === "actors" ? "active" : ""}`} onClick={() => setTab("actors")}>
+            Actors
+          </button>
           <button className={`tab ${tab === "news" ? "active" : ""}`} onClick={() => setTab("news")}>
             News {stats && <span className="muted">({stats.advisories.toLocaleString()})</span>}
           </button>
@@ -203,10 +317,18 @@ export function App() {
         </div>
 
         {tab === "overview" && <Overview reloadKey={reloadKey} stats={stats} />}
-        {tab === "vulns" && <VulnGrid reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "vulnerability")} terms={terms} />}
-        {tab === "iocs" && <IndicatorGrid reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "indicator")} />}
+        {tab === "vulns" && <VulnGrid reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "vulnerability")} terms={terms} onDetail={onDetail} />}
+        {tab === "iocs" && <IndicatorGrid reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "indicator")} onEnrich={onEnrich} canWrite={canWrite} />}
+        {tab === "actors" && <ActorsView reloadKey={reloadKey} onEnrich={onEnrich} />}
         {tab === "news" && <NewsView reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "advisory")} />}
-        {tab === "map" && <MapView reloadKey={reloadKey} />}
+        {tab === "map" && <MapView reloadKey={reloadKey} onEnrich={onEnrich} />}
+        {enrichTarget && <EnrichModal target={enrichTarget} onClose={() => setEnrichTarget(null)} canWrite={canWrite} />}
+        {detailTarget && <VulnDetailModal v={detailTarget} onClose={() => setDetailTarget(null)} canWrite={canWrite} aiEnabled={aiEnabled} />}
+        {showUsers && <UsersPanel onClose={() => setShowUsers(false)} meId={me?.id ?? null} />}
+        {showAudit && <AuditPanel onClose={() => setShowAudit(false)} />}
+        {showAsk && <AskAiModal onClose={() => setShowAsk(false)} onDetail={onDetail} />}
+        {showExtract && <ExtractModal onClose={() => setShowExtract(false)} onEnrich={onEnrich} />}
+        {showSbom && <SbomModal onClose={() => setShowSbom(false)} />}
       </main>
     </>
   );
@@ -306,7 +428,7 @@ const MAP_W = 1000;
 const MAP_H = 500;
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
-function MapView({ reloadKey }: { reloadKey: number }) {
+function MapView({ reloadKey, onEnrich }: { reloadKey: number; onEnrich: (value: string, type: string) => void }) {
   const [points, setPoints] = useState<MapPoint[]>([]);
   const [land, setLand] = useState<Geom[]>([]);
   const [selected, setSelected] = useState<MapPoint | null>(null);
@@ -534,7 +656,7 @@ function MapView({ reloadKey }: { reloadKey: number }) {
             </div>
             {ips.length === 0 && <div className="muted ov-empty">No located indicators.</div>}
             {ips.map((ip, i) => (
-              <div className="ov-row" key={i}>
+              <div className="ov-row map-origin" key={i} onClick={() => onEnrich(ip.value, ip.type)} title="Enrich / pivot">
                 <span className={`badge ioc-${ip.type}`}>{ip.type}</span>
                 <div className="ov-row-text">
                   <div className="ov-primary ioc-value" style={{ maxWidth: "100%" }}>{ip.value}</div>
@@ -555,11 +677,13 @@ function MapView({ reloadKey }: { reloadKey: number }) {
 function Overview({ reloadKey, stats }: { reloadKey: number; stats: Stats | null }) {
   const [digest, setDigest] = useState<Digest | null>(null);
   const [correlations, setCorrelations] = useState<Correlation[]>([]);
+  const [attack, setAttack] = useState<AttackTechnique[]>([]);
   const [preview, setPreview] = useState<null | "html" | "md">(null);
 
   useEffect(() => {
     api.digest().then(setDigest).catch(() => {});
     api.correlations().then(setCorrelations).catch(() => {});
+    api.attack().then(setAttack).catch(() => {});
   }, [reloadKey]);
 
   // While the preview modal is open: Esc closes it and the background is locked.
@@ -655,6 +779,33 @@ function Overview({ reloadKey, stats }: { reloadKey: number; stats: Stats | null
         )}
       </div>
 
+      <div className="section-head" style={{ marginTop: 24 }}>
+        <h2>ATT&amp;CK Techniques in Intel</h2>
+      </div>
+      <div className="panel" style={{ padding: 16 }}>
+        {attack.length === 0 ? (
+          <div className="muted ov-empty">No ATT&amp;CK / ATLAS technique IDs found in current intel yet — they appear as feeds reference them.</div>
+        ) : (
+          <div className="attack-grid">
+            {attack.map((t) => (
+              <a
+                className="attack-chip"
+                key={t.id}
+                href={t.framework === "atlas"
+                  ? `https://atlas.mitre.org/techniques/${t.id}`
+                  : `https://attack.mitre.org/techniques/${t.id.replace(".", "/")}`}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <span className={`badge ${t.framework === "atlas" ? "ioc-domain" : "info"}`}>{t.framework === "atlas" ? "ATLAS" : "ATT&CK"}</span>
+                <span className="attack-id">{t.id}</span>
+                <span className="muted">×{t.count}</span>
+              </a>
+            ))}
+          </div>
+        )}
+      </div>
+
       {preview && digest && (
         <div className="modal-backdrop" onClick={() => setPreview(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -700,7 +851,7 @@ interface VulnFilters {
 }
 const EMPTY_VULN_FILTERS: VulnFilters = { q: "", vendor: "", source: "", minRisk: 0, flag: "", myStack: false };
 
-function VulnGrid({ reloadKey, sources, terms }: { reloadKey: number; sources: Source[]; terms: string[] }) {
+function VulnGrid({ reloadKey, sources, terms, onDetail }: { reloadKey: number; sources: Source[]; terms: string[]; onDetail: (v: Vulnerability) => void }) {
   const [items, setItems] = useState<Vulnerability[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -838,7 +989,9 @@ function VulnGrid({ reloadKey, sources, terms }: { reloadKey: number; sources: S
                 </td>
                 <td className="cve">
                   {mine && <span className="stack-dot" title="In your stack" />}
-                  {v.cveId ?? v.id}
+                  <span className="pivot" onClick={() => onDetail(v)} title="View full details">
+                    {v.cveId ?? v.id}
+                  </span>
                 </td>
                 <td>{v.title}</td>
                 <td className="muted">{[v.vendor, v.product].filter(Boolean).join(" / ") || "—"}</td>
@@ -849,7 +1002,7 @@ function VulnGrid({ reloadKey, sources, terms }: { reloadKey: number; sources: S
                   {v.knownExploited && <span className="flag">EXPLOITED</span>}
                   {v.ransomwareUse && <span className="flag"> · RANSOMWARE</span>}
                 </td>
-                <td className="muted">{v.source}</td>
+                <td className="muted"><SourceCell source={v.source} reliability={reliabilityOf(sources, v.source)} /></td>
               </tr>
             );
           })}
@@ -864,10 +1017,10 @@ function VulnGrid({ reloadKey, sources, terms }: { reloadKey: number; sources: S
 // ---------------------------------------------------------------------------
 // Indicators grid
 
-interface IocFilters { q: string; type: string; source: string }
-const EMPTY_IOC_FILTERS: IocFilters = { q: "", type: "", source: "" };
+interface IocFilters { q: string; type: string; source: string; fresh: boolean }
+const EMPTY_IOC_FILTERS: IocFilters = { q: "", type: "", source: "", fresh: false };
 
-function IndicatorGrid({ reloadKey, sources }: { reloadKey: number; sources: Source[] }) {
+function IndicatorGrid({ reloadKey, sources, onEnrich, canWrite }: { reloadKey: number; sources: Source[]; onEnrich: (value: string, type: string) => void; canWrite: boolean }) {
   const [items, setItems] = useState<Indicator[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -888,6 +1041,7 @@ function IndicatorGrid({ reloadKey, sources }: { reloadKey: number; sources: Sou
       if (filters.q) q.q = filters.q;
       if (filters.type) q.type = filters.type;
       if (filters.source) q.source = filters.source;
+      if (filters.fresh) q.maxAgeDays = 90;
       const p = await api.indicators(q);
       setItems(p.items); setTotal(p.total);
     } catch { /* offline */ } finally { setLoading(false); }
@@ -919,8 +1073,15 @@ function IndicatorGrid({ reloadKey, sources }: { reloadKey: number; sources: Sou
   return (
     <div className="panel">
       <div className="grid-toolbar">
-        <span className="muted">Export current view:</span>
+        <button
+          className={`chip ${filters.fresh ? "on" : ""}`}
+          onClick={() => setFilter("fresh", !filters.fresh)}
+          title="Show only indicators seen in the last 90 days"
+        >
+          <Activity size={14} /> Fresh (90d)
+        </button>
         <div className="spacer" />
+        <span className="muted">Export:</span>
         <button className="chip" onClick={() => download(api.exportIndicatorUrl(exportParams(), "csv"))} title="Download as CSV">
           <Download size={14} /> CSV
         </button>
@@ -933,6 +1094,28 @@ function IndicatorGrid({ reloadKey, sources }: { reloadKey: number; sources: Sou
         <button className="chip" onClick={() => download(api.exportIndicatorUrl(exportParams(), "sigma"))} title="Sigma detection rules (SIEM)">
           Sigma
         </button>
+        <button className="chip" onClick={() => download(api.exportIndicatorUrl(exportParams(), "yara"))} title="YARA rules">
+          YARA
+        </button>
+        <button className="chip" onClick={() => download(api.exportIndicatorUrl(exportParams(), "snort"))} title="Suricata/Snort rules">
+          Snort
+        </button>
+        {canWrite && (
+          <label className="chip" style={{ cursor: "pointer" }} title="Import a STIX 2.1 bundle">
+            Import STIX
+            <input
+              type="file"
+              accept=".json,application/json"
+              style={{ display: "none" }}
+              onChange={async (e) => {
+                const file = e.target.files?.[0];
+                if (!file) return;
+                try { await api.importStix(JSON.parse(await file.text())); load(); } catch { /* invalid */ }
+                e.target.value = "";
+              }}
+            />
+          </label>
+        )}
       </div>
       <table>
         <thead>
@@ -977,12 +1160,15 @@ function IndicatorGrid({ reloadKey, sources }: { reloadKey: number; sources: Sou
           {items.map((i) => (
             <tr key={`${i.source}:${i.id}`}>
               <td><span className={`badge ioc-${i.type}`}>{i.type}</span></td>
-              <td className="ioc-value">{i.value}</td>
+              <td className="ioc-value pivot" onClick={() => onEnrich(i.value, i.type)} title="Enrich / pivot">{i.value}</td>
               <td>{i.malware ?? "—"}</td>
               <td className="muted">{i.threatType ?? "—"}</td>
               <td className="muted">{i.confidence != null ? `${i.confidence}%` : "—"}</td>
-              <td className="muted">{formatDate(i.lastSeen)}</td>
-              <td className="muted">{i.source}</td>
+              <td className="muted">
+                {formatDate(i.lastSeen)}
+                {isStale(i.lastSeen) && <span className="badge stale" title="Last seen over 90 days ago">stale</span>}
+              </td>
+              <td className="muted"><SourceCell source={i.source} reliability={reliabilityOf(sources, i.source)} /></td>
             </tr>
           ))}
         </tbody>
@@ -1033,6 +1219,681 @@ function StatCard(props: { icon: React.ReactNode; label: string; value?: number;
         {props.icon} {props.label}
       </div>
       <div className="value">{props.value ?? "—"}</div>
+    </div>
+  );
+}
+
+function SbomModal({ onClose }: { onClose: () => void }) {
+  const [report, setReport] = useState<import("./api.ts").SbomReport | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [fileName, setFileName] = useState("");
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
+
+  async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setFileName(file.name); setError(""); setReport(null); setBusy(true);
+    try {
+      const obj = JSON.parse(await file.text());
+      setReport(await api.sbom(obj));
+    } catch (err) {
+      setError(`Could not scan: ${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title">SBOM Scan {report && <span className="muted">· {report.vulnerable}/{report.total} components vulnerable</span>}</div>
+          <div className="spacer" />
+          <label className="chip" style={{ cursor: "pointer" }}>
+            <Package size={14} /> Choose file
+            <input type="file" accept=".json,application/json" style={{ display: "none" }} onChange={onFile} />
+          </label>
+          <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body" style={{ padding: 16 }}>
+          {!report && !busy && !error && (
+            <div className="muted ov-empty">Upload a CycloneDX or SPDX SBOM (JSON). Components are matched against OSV — keyless, no upload leaves your machine except component coordinates.</div>
+          )}
+          {busy && <div className="muted" style={{ padding: 12 }}>Scanning {fileName} against OSV…</div>}
+          {error && <div className="muted ov-empty" style={{ color: "var(--critical)" }}>{error}</div>}
+          {report && (
+            <div className="panel" style={{ padding: 0 }}>
+              <table>
+                <thead><tr><th>Component</th><th>Ecosystem</th><th>Version</th><th>Vulnerabilities</th></tr></thead>
+                <tbody>
+                  {report.components.map((c) => (
+                    <tr key={c.purl}>
+                      <td className="ioc-value">{c.name}</td>
+                      <td className="muted">{c.ecosystem}</td>
+                      <td className="muted">{c.version}</td>
+                      <td>
+                        {c.vulns.length === 0 ? <span className="muted">—</span> : c.vulns.map((id) => (
+                          <a key={id} className="badge critical" style={{ marginRight: 4, textDecoration: "none" }}
+                            href={`https://osv.dev/vulnerability/${id}`} target="_blank" rel="noopener noreferrer">{id}</a>
+                        ))}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ExtractModal({ onClose, onEnrich }: { onClose: () => void; onEnrich: (value: string, type: string) => void }) {
+  const [text, setText] = useState("");
+  const [fanged, setFanged] = useState(false); // defang output for safe sharing
+  const iocs: ExtractedIocs | null = text.trim() ? extractIocs(text) : null;
+  const fmt = (v: string) => (fanged ? defang(v) : v);
+  const total = iocs ? iocs.ips.length + iocs.domains.length + iocs.urls.length + iocs.hashes.length + iocs.cves.length : 0;
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
+
+  const copy = (items: string[]) => { navigator.clipboard?.writeText(items.map(fmt).join("\n")).catch(() => {}); };
+
+  function Group({ title, items, type }: { title: string; items: string[]; type?: string }) {
+    if (items.length === 0) return null;
+    return (
+      <div className="extract-group">
+        <div className="extract-group-head">
+          <span className="ov-card-title" style={{ margin: 0 }}>{title} <span className="muted">({items.length})</span></span>
+          <button className="icon-btn" data-tooltip="Copy" aria-label="Copy" onClick={() => copy(items)}><Copy size={14} /></button>
+        </div>
+        {items.map((v) => (
+          <div className="extract-row" key={v}>
+            <span className="ioc-value">{fmt(v)}</span>
+            {type === "ip" && <button className="chip mini" onClick={() => onEnrich(v, "ip")}>enrich</button>}
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title">Extract IOCs {total > 0 && <span className="muted">· {total} found</span>}</div>
+          <div className="spacer" />
+          <label className="chip" style={{ cursor: "pointer" }}>
+            <input type="checkbox" checked={fanged} onChange={(e) => setFanged(e.target.checked)} style={{ marginRight: 6 }} />
+            Defang output
+          </label>
+          <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body" style={{ padding: 16 }}>
+          <textarea
+            className="note-input"
+            style={{ width: "100%", minHeight: 120 }}
+            placeholder="Paste an email, report, or chat log — IOCs are extracted automatically (defanged input like 1[.]2[.]3[.]4 and hxxp:// is handled)."
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+          />
+          {iocs && total === 0 && <div className="muted ov-empty">No IOCs found.</div>}
+          {iocs && total > 0 && (
+            <div className="extract-results">
+              <Group title="IPs" items={iocs.ips} type="ip" />
+              <Group title="Domains" items={iocs.domains} />
+              <Group title="URLs" items={iocs.urls} />
+              <Group title="Hashes" items={iocs.hashes} />
+              <Group title="CVEs" items={iocs.cves} />
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const TLP_LEVELS = ["clear", "green", "amber", "red"] as const;
+
+function NotesSection({ refKey, canWrite }: { refKey: string; canWrite: boolean }) {
+  const [notes, setNotes] = useState<import("./api.ts").Note[]>([]);
+  const [body, setBody] = useState("");
+  const [tlp, setTlp] = useState<string>("amber");
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    api.notes(refKey).then(setNotes).catch(() => setNotes([])).finally(() => setLoading(false));
+  }, [refKey]);
+  useEffect(() => { load(); }, [load]);
+
+  async function add(e: FormEvent) {
+    e.preventDefault();
+    if (!body.trim()) return;
+    try { await api.addNote(refKey, tlp, body.trim()); setBody(""); load(); } catch { /* offline */ }
+  }
+  async function remove(id: string) {
+    try { await api.deleteNote(id); load(); } catch { /* offline */ }
+  }
+
+  return (
+    <div className="notes-section">
+      <div className="ov-card-title">Notes</div>
+      {canWrite && (
+        <form onSubmit={add} className="note-form">
+          <select className="page-size" value={tlp} onChange={(e) => setTlp(e.target.value)} aria-label="TLP">
+            {TLP_LEVELS.map((l) => <option key={l} value={l}>TLP:{l.toUpperCase()}</option>)}
+          </select>
+          <textarea className="note-input" value={body} onChange={(e) => setBody(e.target.value)} placeholder="Add an investigation note…" rows={2} />
+          <button className="btn-primary" type="submit"><Plus size={16} /> Add</button>
+        </form>
+      )}
+      {loading && <div className="muted" style={{ padding: 8 }}>Loading…</div>}
+      {!loading && notes.length === 0 && <div className="muted ov-empty">No notes yet.</div>}
+      {notes.map((n) => (
+        <div className="note" key={n.id}>
+          <div className="note-meta">
+            <span className={`badge tlp-${n.tlp}`}>TLP:{n.tlp.toUpperCase()}</span>
+            <span className="muted">{new Date(n.createdAt).toLocaleString()}</span>
+            <div className="spacer" />
+            {canWrite && <button className="icon-btn note-del" data-tooltip="Delete" aria-label="Delete note" onClick={() => remove(n.id)}><X size={14} /></button>}
+          </div>
+          <div className="note-body">{n.body}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function VulnDetailModal({ v, onClose, canWrite, aiEnabled }: { v: Vulnerability; onClose: () => void; canWrite: boolean; aiEnabled: boolean }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
+  const band = riskBand(v.riskScore);
+  const cve = v.cveId ?? v.id;
+  const [summary, setSummary] = useState("");
+  const [summarizing, setSummarizing] = useState(false);
+  const [aiErr, setAiErr] = useState("");
+  async function summarize() {
+    setSummarizing(true); setAiErr("");
+    try {
+      const text = `${cve}: ${v.title}\n\n${v.description}\n\nVendor: ${v.vendor ?? "?"} ${v.product ?? ""}. CVSS ${v.cvss ?? "n/a"}, EPSS ${v.epss ?? "n/a"}.${v.knownExploited ? " Known exploited." : ""}`;
+      const r = await api.aiSummarize(text);
+      setSummary(r.summary);
+    } catch { setAiErr("Summarization failed — check the AI/Ollama connection."); }
+    finally { setSummarizing(false); }
+  }
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title"><span className="cve">{cve}</span> <span className={`badge ${band}`}>{v.riskScore}</span></div>
+          <div className="spacer" />
+          {v.cveId && (
+            <a className="chip" href={`https://nvd.nist.gov/vuln/detail/${v.cveId}`} target="_blank" rel="noopener noreferrer"><ExternalLink size={14} /> NVD</a>
+          )}
+          {aiEnabled && (
+            <button className="icon-btn" data-tooltip="Summarize with AI" aria-label="Summarize with AI" disabled={summarizing} onClick={summarize}>
+              <Sparkles size={16} className={summarizing ? "pulse" : ""} />
+            </button>
+          )}
+          <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body" style={{ padding: 18 }}>
+          <div className="vuln-title">{v.title}</div>
+          <div className="vuln-flags">
+            {v.knownExploited && <span className="flag">EXPLOITED (KEV)</span>}
+            {v.ransomwareUse && <span className="flag"> · RANSOMWARE</span>}
+          </div>
+          {v.description && <p className="vuln-desc">{v.description}</p>}
+          {(summary || aiErr) && (
+            <div className="ai-summary">
+              <div className="ov-card-title"><Sparkles size={13} /> AI summary</div>
+              {aiErr ? <p className="login-error">{aiErr}</p> : <p className="vuln-desc">{summary}</p>}
+            </div>
+          )}
+          <div className="vuln-facts">
+            <EnrichRow label="Vendor / product" val={[v.vendor, v.product].filter(Boolean).join(" / ") || "—"} />
+            <EnrichRow label="CVSS" val={v.cvss != null ? String(v.cvss) : "—"} />
+            <EnrichRow label="EPSS" val={v.epss != null ? `${(v.epss * 100).toFixed(1)}%` : "—"} />
+            <EnrichRow label="CWEs" val={v.cwes.length ? v.cwes.join(", ") : "—"} />
+            <EnrichRow label="Reported" val={formatDate(v.dateAdded)} />
+            {v.dueDate && <EnrichRow label="Remediation due" val={formatDate(v.dueDate)} />}
+            <EnrichRow label="Source" val={v.source} />
+          </div>
+          {v.requiredAction && (
+            <div className="vuln-action">
+              <div className="ov-card-title">Required action</div>
+              <p className="vuln-desc">{v.requiredAction}</p>
+            </div>
+          )}
+          {v.references.length > 0 && (
+            <div className="vuln-refs">
+              <div className="ov-card-title">References</div>
+              {v.references.map((r) => (
+                <a key={r} className="vuln-ref" href={r} target="_blank" rel="noopener noreferrer">{r}</a>
+              ))}
+            </div>
+          )}
+          <NotesSection refKey={`cve:${cve}`} canWrite={canWrite} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EnrichRow({ label, val, crit }: { label: string; val: string; crit?: boolean }) {
+  return (
+    <div className="enrich-row">
+      <span className="muted">{label}</span>
+      <span className={crit ? "crit-text" : ""}>{val}</span>
+    </div>
+  );
+}
+
+function EnrichModal({ target, onClose, canWrite }: { target: { value: string; type: string }; onClose: () => void; canWrite: boolean }) {
+  const [data, setData] = useState<import("./api.ts").IocEnrichment | null>(null);
+  const [loading, setLoading] = useState(true);
+  const ipForLinks = target.value.split(":")[0];
+
+  useEffect(() => {
+    setLoading(true);
+    api.enrichIoc(target.value, target.type).then(setData).catch(() => setData(null)).finally(() => setLoading(false));
+  }, [target.value, target.type]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
+
+  const hasAny = data && (data.shodan || data.greynoise || data.abuseipdb);
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title ioc-value">{target.value}</div>
+          <div className="spacer" />
+          <a className="chip" href={`https://www.virustotal.com/gui/search/${encodeURIComponent(ipForLinks)}`} target="_blank" rel="noopener noreferrer">
+            <ExternalLink size={14} /> VirusTotal
+          </a>
+          <a className="chip" href={`https://www.shodan.io/host/${encodeURIComponent(ipForLinks)}`} target="_blank" rel="noopener noreferrer">
+            <ExternalLink size={14} /> Shodan
+          </a>
+          <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body" style={{ padding: 16 }}>
+          {loading && <div className="muted" style={{ padding: 20 }}>Enriching…</div>}
+          {!loading && data && (
+            <div className="enrich">
+              {data.shodan && (
+                <div className="panel enrich-card">
+                  <div className="ov-card-title">Shodan InternetDB</div>
+                  <EnrichRow label="Open ports" val={data.shodan.ports.join(", ") || "—"} />
+                  <EnrichRow label="Hostnames" val={data.shodan.hostnames.join(", ") || "—"} />
+                  <EnrichRow label="Tags" val={data.shodan.tags.join(", ") || "—"} />
+                  <EnrichRow label="Known CVEs" val={data.shodan.vulns.join(", ") || "—"} crit={data.shodan.vulns.length > 0} />
+                </div>
+              )}
+              {data.greynoise && (
+                <div className="panel enrich-card">
+                  <div className="ov-card-title">GreyNoise</div>
+                  <EnrichRow label="Classification" val={data.greynoise.classification} crit={data.greynoise.classification === "malicious"} />
+                  <EnrichRow label="Internet scanner" val={data.greynoise.noise ? "yes" : "no"} />
+                  <EnrichRow label="Benign (RIOT)" val={data.greynoise.riot ? "yes" : "no"} />
+                  {data.greynoise.name && <EnrichRow label="Actor / tool" val={data.greynoise.name} />}
+                </div>
+              )}
+              {data.abuseipdb && (
+                <div className="panel enrich-card">
+                  <div className="ov-card-title">AbuseIPDB</div>
+                  <EnrichRow label="Abuse score" val={`${data.abuseipdb.score}%`} crit={data.abuseipdb.score >= 50} />
+                  <EnrichRow label="Reports" val={String(data.abuseipdb.reports)} />
+                  <EnrichRow label="Country" val={data.abuseipdb.countryCode ?? "—"} />
+                  {data.abuseipdb.isp && <EnrichRow label="ISP" val={data.abuseipdb.isp} />}
+                </div>
+              )}
+              {!hasAny && (
+                <div className="muted" style={{ padding: 20 }}>{data.errors[0] ?? "No enrichment data available."}</div>
+              )}
+              {hasAny && data.errors.length > 0 && (
+                <div className="muted enrich-errors">{data.errors.join("; ")}</div>
+              )}
+            </div>
+          )}
+          <NotesSection refKey={`ioc:${target.value}`} canWrite={canWrite} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Login({ onLogin, theme }: { onLogin: (u: User) => void; theme: "dark" | "light" }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [sso, setSso] = useState<{ enabled: boolean; label: string }>({ enabled: false, label: "SSO" });
+  useEffect(() => { document.documentElement.setAttribute("data-theme", theme); }, [theme]);
+  useEffect(() => {
+    api.authConfig().then((c) => setSso({ enabled: Boolean(c.sso), label: c.ssoLabel || "SSO" })).catch(() => {});
+  }, []);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    setError(""); setBusy(true);
+    try {
+      const r = await api.login(username, password);
+      setToken(r.token);
+      onLogin(r.user);
+    } catch {
+      setError("Invalid username or password.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="login-wrap">
+      <form className="panel login-card" onSubmit={submit}>
+        <div className="brand" style={{ justifyContent: "center", marginBottom: 14 }}>
+          <Radar size={26} className="mark" />
+          <div>OmniSight <br /><small>Cyber Situational Awareness</small></div>
+        </div>
+        <div className="login-title"><Lock size={14} /> Sign in</div>
+        <input className="note-input" placeholder="Username" value={username} onChange={(e) => setUsername(e.target.value)} autoFocus />
+        <input className="note-input" type="password" placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)} />
+        {error && <div className="login-error">{error}</div>}
+        <button className="btn-primary" type="submit" disabled={busy} style={{ justifyContent: "center" }}>{busy ? "Signing in…" : "Sign in"}</button>
+        {sso.enabled && (
+          <>
+            <div className="login-or"><span>or</span></div>
+            <a className="btn-secondary" href="/api/auth/sso/login" style={{ justifyContent: "center" }}>
+              <KeyRound size={14} /> Sign in with {sso.label}
+            </a>
+          </>
+        )}
+      </form>
+    </div>
+  );
+}
+
+function UsersPanel({ onClose, meId }: { onClose: () => void; meId: string | null }) {
+  const [users, setUsers] = useState<User[]>([]);
+  const [u, setU] = useState("");
+  const [p, setP] = useState("");
+  const [role, setRole] = useState("viewer");
+  const [error, setError] = useState("");
+
+  const load = useCallback(() => { api.users().then(setUsers).catch(() => {}); }, []);
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
+
+  async function add(e: FormEvent) {
+    e.preventDefault();
+    setError("");
+    try { await api.createUser(u, p, role); setU(""); setP(""); load(); }
+    catch (err) { setError((err as Error).message); }
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title">Users</div>
+          <div className="spacer" />
+          <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body" style={{ padding: 16 }}>
+          <form onSubmit={add} className="user-form">
+            <input className="note-input" placeholder="username" value={u} onChange={(e) => setU(e.target.value)} />
+            <input className="note-input" type="password" placeholder="password" value={p} onChange={(e) => setP(e.target.value)} />
+            <select className="page-size" value={role} onChange={(e) => setRole(e.target.value)}>
+              <option value="viewer">viewer</option>
+              <option value="analyst">analyst</option>
+              <option value="admin">admin</option>
+            </select>
+            <button className="btn-primary" type="submit"><Plus size={16} /> Add</button>
+          </form>
+          {error && <div className="login-error">{error}</div>}
+          {users.map((usr) => (
+            <div className="ov-row" key={usr.id}>
+              <div className="ov-row-text"><div className="ov-primary">{usr.username}{usr.id === meId && <span className="muted"> (you)</span>}</div></div>
+              <div className="spacer" />
+              <select className="page-size" value={usr.role} onChange={(e) => { api.setUserRole(usr.id, e.target.value).then(load).catch(() => {}); }}>
+                <option value="viewer">viewer</option>
+                <option value="analyst">analyst</option>
+                <option value="admin">admin</option>
+              </select>
+              {usr.id !== meId && (
+                <button className="icon-btn note-del" data-tooltip="Delete" aria-label="Delete user" onClick={() => api.deleteUser(usr.id).then(load).catch(() => {})}><Trash2 size={14} /></button>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function techniqueUrl(id: string): string {
+  return id.startsWith("AML")
+    ? `https://atlas.mitre.org/techniques/${id}`
+    : `https://attack.mitre.org/techniques/${id.replace(".", "/")}`;
+}
+
+// ---------------------------------------------------------------------------
+// Actor / campaign profiles
+
+function ActorsView({ reloadKey, onEnrich }: { reloadKey: number; onEnrich: (value: string, type: string) => void }) {
+  const [actors, setActors] = useState<ActorProfile[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [q, setQ] = useState("");
+  const [open, setOpen] = useState<string | null>(null);
+
+  useEffect(() => {
+    setLoading(true);
+    api.actors().then(setActors).catch(() => setActors([])).finally(() => setLoading(false));
+  }, [reloadKey]);
+
+  const filtered = actors.filter((a) => a.name.toLowerCase().includes(q.toLowerCase()));
+
+  return (
+    <section className="panel">
+      <div className="grid-toolbar">
+        <div className="toolbar-title"><Bug size={16} /> Actor &amp; campaign profiles <span className="muted">({actors.length})</span></div>
+        <div className="spacer" />
+        <input className="note-input" style={{ maxWidth: 220 }} placeholder="Filter by malware/campaign…" value={q} onChange={(e) => setQ(e.target.value)} />
+      </div>
+      {loading && <div className="empty">Loading…</div>}
+      {!loading && filtered.length === 0 && <div className="empty">No actor profiles yet — they build up as malware-tagged indicators are ingested.</div>}
+      <div className="actor-grid">
+        {filtered.map((a) => {
+          const isOpen = open === a.name;
+          return (
+            <div className={`actor-card ${isOpen ? "open" : ""}`} key={a.name}>
+              <button className="actor-head" onClick={() => setOpen(isOpen ? null : a.name)}>
+                <div className="actor-name">{a.name}</div>
+                <span className="badge rel-A">{a.indicatorCount} IOC{a.indicatorCount === 1 ? "" : "s"}</span>
+              </button>
+              <div className="actor-types">
+                {Object.entries(a.types).map(([t, n]) => <span className="chip" key={t}>{t} · {n}</span>)}
+              </div>
+              <div className="actor-meta muted">
+                {a.sources.length} source{a.sources.length === 1 ? "" : "s"} · last seen {formatDate(a.lastSeen)}
+              </div>
+              {isOpen && (
+                <div className="actor-detail">
+                  {a.cves.length > 0 && (
+                    <div className="actor-block">
+                      <div className="ov-card-title">Related CVEs</div>
+                      <div className="actor-chips">
+                        {a.cves.map((c) => <a className="chip" key={c} href={`https://nvd.nist.gov/vuln/detail/${c}`} target="_blank" rel="noopener noreferrer">{c}</a>)}
+                      </div>
+                    </div>
+                  )}
+                  {a.techniques.length > 0 && (
+                    <div className="actor-block">
+                      <div className="ov-card-title">Techniques</div>
+                      <div className="actor-chips">
+                        {a.techniques.map((t) => <a className="chip" key={t} href={techniqueUrl(t)} target="_blank" rel="noopener noreferrer">{t}</a>)}
+                      </div>
+                    </div>
+                  )}
+                  <div className="actor-block">
+                    <div className="ov-card-title">Sample indicators</div>
+                    <div className="actor-chips">
+                      {a.sampleIocs.map((s) => (
+                        s.type === "ip"
+                          ? <button className="chip mono" key={s.value} onClick={() => onEnrich(s.value, s.type)} data-tooltip="Enrich">{defang(s.value)}</button>
+                          : <span className="chip mono" key={s.value}>{defang(s.value)}</span>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="actor-block muted">Sources: {a.sources.join(", ")}</div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Ask AI — natural-language vulnerability query
+
+function AskAiModal({ onClose, onDetail }: { onClose: () => void; onDetail: (v: Vulnerability) => void }) {
+  const [q, setQ] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [filters, setFilters] = useState<Record<string, unknown> | null>(null);
+  const [items, setItems] = useState<Vulnerability[]>([]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
+
+  async function run(e: FormEvent) {
+    e.preventDefault();
+    if (!q.trim()) return;
+    setBusy(true); setErr(""); setFilters(null); setItems([]);
+    try {
+      const r = await api.aiQuery(q.trim());
+      setFilters(r.filters); setItems(r.items);
+    } catch { setErr("Query failed — check the AI/Ollama connection."); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title"><Sparkles size={16} /> Ask AI</div>
+          <div className="spacer" />
+          <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body" style={{ padding: 16 }}>
+          <form onSubmit={run} className="ask-form">
+            <input className="note-input" autoFocus placeholder='e.g. "exploited Cisco bugs, highest risk first"' value={q} onChange={(e) => setQ(e.target.value)} />
+            <button className="btn-primary" type="submit" disabled={busy}><Sparkles size={16} /> {busy ? "Thinking…" : "Ask"}</button>
+          </form>
+          <div className="muted" style={{ fontSize: 12, margin: "6px 0 10px" }}>The model translates your question into filters, then OmniSight runs them against the live data.</div>
+          {err && <div className="login-error">{err}</div>}
+          {filters && (
+            <div className="actor-chips" style={{ marginBottom: 10 }}>
+              {Object.entries(filters).map(([k, v]) => <span className="chip" key={k}>{k}: {String(v)}</span>)}
+              {Object.keys(filters).length === 0 && <span className="muted">No filters inferred — showing top results.</span>}
+            </div>
+          )}
+          {items.map((v) => (
+            <div className="ov-row" key={`${v.source}:${v.id}`} onClick={() => { onDetail(v); onClose(); }} style={{ cursor: "pointer" }}>
+              <span className={`badge ${riskBand(v.riskScore)}`}>{v.riskScore}</span>
+              <div className="ov-row-text">
+                <div className="ov-primary">{v.cveId ?? v.id}{v.knownExploited && <span className="flag"> EXPLOITED</span>}</div>
+                <div className="ov-secondary muted">{v.title}</div>
+              </div>
+            </div>
+          ))}
+          {filters && items.length === 0 && !err && <div className="empty">No matches.</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Audit log (admin)
+
+function AuditPanel({ onClose }: { onClose: () => void }) {
+  const [entries, setEntries] = useState<AuditEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    setLoading(true);
+    api.audit().then(setEntries).catch(() => setEntries([])).finally(() => setLoading(false));
+  }, []);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title"><ScrollText size={16} /> Audit log</div>
+          <div className="spacer" />
+          <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body" style={{ padding: 16 }}>
+          {loading && <div className="empty">Loading…</div>}
+          {!loading && entries.length === 0 && <div className="empty">No audit entries yet.</div>}
+          {entries.map((a) => (
+            <div className="ov-row audit-row" key={a.id}>
+              <span className={`badge ${a.status && a.status >= 400 ? "crit" : "rel-B"}`}>{a.status ?? "—"}</span>
+              <div className="ov-row-text">
+                <div className="ov-primary mono">{a.action}</div>
+                <div className="ov-secondary muted">{a.user ?? "anon"}{a.role ? ` (${a.role})` : ""} · {new Date(a.at).toLocaleString()}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

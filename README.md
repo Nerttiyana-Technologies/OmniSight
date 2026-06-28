@@ -48,6 +48,42 @@ bundle). Items render as cards with source, date, and summary, filterable by
 source and search. New RSS feeds can be added at runtime as `kind: "rss"`
 sources — no code required.
 
+### Auth & roles (opt-in)
+
+Off by default (open). Set `AUTH_ENABLED=true` + `JWT_SECRET` and seed an admin
+(`ADMIN_USER`/`ADMIN_PASS`) to require login. Three roles — **viewer** (read-only),
+**analyst** (notes, watchlist, enrich, import), **admin** (+ manage sources &
+users). Local username/password (scrypt-hashed) with JWTs; RBAC enforced
+server-side and reflected in the UI. **SSO** is supported via a generic OIDC
+authorization-code flow — set the `OIDC_*` vars to show a "Sign in with SSO"
+button; first-time users are auto-provisioned as viewers. An **audit log**
+(admin-only) records mutating actions and logins for compliance review.
+
+### AI layer (optional, local-first)
+
+Point OmniSight at any OpenAI-compatible endpoint — including a **local Ollama**
+(`LLM_BASE_URL=http://localhost:11434/v1`, no key, nothing leaves your machine).
+Two features light up when configured: a **Summarize** button on any CVE that
+turns the raw advisory into a 2–3 sentence SOC-ready brief, and an **Ask AI**
+box that translates a natural-language question ("exploited Cisco bugs, highest
+risk first") into structured filters and runs them against the live data. The
+model only ever produces *filters*; OmniSight executes the query, so results are
+grounded in real records. Everything degrades gracefully when no LLM is set.
+
+### Actor & campaign profiles
+
+An **Actors** tab aggregates indicators by malware family / campaign into
+profiles: IOC counts by type, contributing sources, first/last activity, and the
+related CVEs and ATT&CK/ATLAS techniques extracted from their intel — with
+sample IOCs you can pivot into enrichment. Assembled entirely from ingested
+feeds, so it grows as you connect more sources.
+
+### SOAR-lite ticketing
+
+Beyond webhook and email alerts, the worker can **open a Jira issue per
+stack-affecting vulnerability** (`JIRA_*` vars, Jira Cloud REST v2) — turning
+"a KEV just hit my stack" into an actionable, de-duplicated ticket automatically.
+
 ### Map
 
 A **Map** tab plots geolocated attack origins on a world projection. IP
@@ -70,6 +106,17 @@ indicators export to **CSV**, a **STIX 2.1 bundle** (importable into OpenCTI /
 MISP), a plain **blocklist** (IPs/domains/URLs/hashes) for firewalls and IDS, or
 **Sigma detection rules** for your SIEM — so OmniSight pushes intel into the rest
 of your stack rather than trapping it.
+
+### Analyst workflow
+
+- **IOC enrichment / pivoting** — click any IP to enrich live via Shodan
+  InternetDB (ports, hostnames, host CVEs), plus GreyNoise/AbuseIPDB when keyed,
+  with pivot links to VirusTotal/Shodan.
+- **My Stack alerts** — the worker notifies (Slack-style webhook and/or email)
+  when an exploited or high-risk CVE matches your stack; de-duplicated.
+- **Investigation notes + TLP** — attach TLP-marked notes to any CVE or IOC.
+- **ATT&CK techniques in intel** — ATT&CK/ATLAS technique IDs referenced across
+  ingested advisories and indicators, ranked by frequency and linked out.
 
 ### Cross-source correlation
 

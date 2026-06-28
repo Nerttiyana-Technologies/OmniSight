@@ -228,6 +228,77 @@ tr:hover td { background: var(--bg-elev-2); }
 .brief-frame { width: 100%; height: 70vh; border: none; background: #fff; display: block; }
 .brief-md { margin: 0; padding: 20px; white-space: pre-wrap; word-break: break-word; font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 13px; line-height: 1.5; color: var(--text); }
 
+/* IOC enrichment / pivoting */
+.ioc-value.pivot { cursor: pointer; }
+.ioc-value.pivot:hover { color: var(--accent); text-decoration: underline; }
+.enrich { display: grid; gap: 14px; }
+.enrich-card { padding: 14px 16px; }
+.enrich-row { display: flex; justify-content: space-between; gap: 16px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.enrich-row:last-child { border-bottom: none; }
+.enrich-row > span:last-child { text-align: right; word-break: break-word; font-family: "JetBrains Mono", ui-monospace, monospace; }
+.crit-text { color: var(--critical); font-weight: 600; }
+.enrich-errors { font-size: 12px; padding-top: 4px; }
+
+/* Investigation notes + TLP */
+.note-form { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 16px; }
+.note-input { flex: 1; padding: 9px 11px; border-radius: 9px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 14px; font-family: inherit; resize: vertical; }
+.note-input:focus { outline: none; border-color: var(--accent); }
+.notes-section { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+.note { padding: 10px 0; border-bottom: 1px solid var(--border); }
+.note:last-child { border-bottom: none; }
+.note-meta { display: flex; align-items: center; gap: 10px; font-size: 11px; margin-bottom: 4px; }
+.note-body { font-size: 14px; line-height: 1.4; white-space: pre-wrap; word-break: break-word; }
+.note-del { width: 26px; height: 26px; }
+.badge.tlp-clear { background: var(--bg-elev-2); color: var(--text-muted); }
+.badge.tlp-green { background: rgba(59,156,110,0.16); color: var(--low); }
+.badge.tlp-amber { background: rgba(224,146,47,0.18); color: var(--high); }
+.badge.tlp-red { background: rgba(229,72,77,0.16); color: var(--critical); }
+
+/* ATT&CK techniques */
+.attack-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+.attack-chip {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 10px; border-radius: 10px; border: 1px solid var(--border);
+  background: var(--bg-elev-2); text-decoration: none; color: var(--text); font-size: 13px;
+}
+.attack-chip:hover { border-color: var(--accent); }
+.attack-id { font-family: "JetBrains Mono", ui-monospace, monospace; font-weight: 600; }
+
+/* IOC extractor */
+.extract-results { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-top: 14px; }
+@media (max-width: 760px) { .extract-results { grid-template-columns: 1fr; } }
+.extract-group { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--bg); }
+.extract-group-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.extract-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 3px 0; font-size: 13px; }
+.chip.mini { padding: 2px 8px; font-size: 11px; font-weight: 600; }
+
+/* Source reliability + IOC decay */
+.badge.rel-A { background: rgba(59,156,110,0.16); color: var(--low); }
+.badge.rel-B { background: rgba(216,198,74,0.18); color: var(--medium); }
+.badge.rel-C { background: var(--bg-elev-2); color: var(--text-muted); }
+.badge.rel-D, .badge.rel-F { background: rgba(224,146,47,0.16); color: var(--high); }
+.badge.stale { background: var(--bg-elev-2); color: var(--text-muted); margin-left: 8px; font-style: italic; }
+
+/* CVE detail modal */
+.vuln-title { font-size: 16px; font-weight: 600; line-height: 1.4; }
+.vuln-flags { margin: 6px 0 12px; }
+.vuln-desc { font-size: 14px; line-height: 1.55; color: var(--text); margin: 8px 0; }
+.vuln-facts { margin: 12px 0; }
+.vuln-action { margin-top: 14px; }
+.vuln-refs { margin-top: 14px; }
+.vuln-ref { display: block; font-size: 12px; color: var(--accent); text-decoration: none; padding: 3px 0; word-break: break-all; }
+.vuln-ref:hover { text-decoration: underline; }
+
+/* Auth */
+.user-chip { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-right: 4px; }
+.user-name { color: var(--text); font-weight: 600; }
+.login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; background: var(--bg); }
+.login-card { width: 360px; max-width: 100%; padding: 26px; display: flex; flex-direction: column; gap: 12px; }
+.login-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); display: flex; align-items: center; gap: 6px; }
+.login-error { color: var(--critical); font-size: 13px; }
+.user-form { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+.user-form .note-input { flex: 1; min-width: 120px; }
+
 /* News / advisories */
 .news-toolbar { display: flex; gap: 12px; margin-bottom: 16px; }
 .news-search { flex: 1; padding: 9px 12px; border-radius: 9px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); font-size: 14px; }
@@ -333,3 +404,40 @@ th.sortable:hover { color: var(--accent); }
 }
 .pulse { animation: pulse-fade 1.8s ease-in-out infinite; }
 @keyframes pulse-fade { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+/* Shared helpers added with AI/actors/audit/SSO */
+.empty { color: var(--text-muted); font-size: 13px; padding: 22px 6px; text-align: center; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.toolbar-title { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.btn-secondary { display: inline-flex; align-items: center; gap: 8px; padding: 9px 14px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); font-size: 14px; cursor: pointer; text-decoration: none; }
+.btn-secondary:hover { border-color: var(--accent); }
+.login-or { display: flex; align-items: center; text-align: center; color: var(--text-muted); font-size: 12px; margin: 12px 0; }
+.login-or::before, .login-or::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+.login-or span { padding: 0 10px; }
+
+/* AI summary block in the CVE detail modal */
+.ai-summary { margin: 12px 0; padding: 12px 14px; border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  border-radius: 8px; background: var(--accent-soft); }
+.ai-summary .ov-card-title { display: flex; align-items: center; gap: 6px; }
+.ask-form { display: flex; gap: 8px; }
+.ask-form .note-input { flex: 1; }
+
+/* Actor / campaign profiles */
+.actor-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; margin-top: 12px; }
+.actor-card { border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elev); padding: 12px 14px; }
+.actor-card.open { border-color: var(--accent); }
+.actor-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%;
+  background: none; border: none; color: var(--text); cursor: pointer; padding: 0; text-align: left; }
+.actor-name { font-weight: 600; font-size: 15px; word-break: break-word; }
+.actor-types { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 6px; }
+.actor-meta { font-size: 12px; }
+.actor-detail { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.actor-block { margin-bottom: 12px; }
+.actor-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.actor-chips .chip { cursor: default; }
+.actor-chips button.chip { cursor: pointer; }
+.actor-chips a.chip:hover, .actor-chips button.chip:hover { border-color: var(--accent); }
+
+/* Audit log rows */
+.audit-row .ov-primary { font-size: 13px; }

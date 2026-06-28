@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import pg from "pg";
 import {
   computeRiskScore, buildDigest,
-  type Source, type Vulnerability, type Indicator, type Advisory, type Digest,
+  type Source, type Vulnerability, type Indicator, type Advisory, type Digest, type User, type Role,
 } from "@omnisight/shared";
 
 export interface ListOptions {
@@ -46,6 +46,7 @@ export interface IndicatorListOptions {
   malware?: string;
   q?: string;
   source?: string;
+  maxAgeDays?: number; // "fresh only": drop indicators last seen older than this
   sort?: string; // confidence | lastseen | type | malware | value | source
   dir?: "asc" | "desc";
 }
@@ -86,7 +87,120 @@ export interface Correlation {
   indicators: { value: string; source: string; malware: string | null; type: string }[];
 }
 
+export interface Note {
+  id: string;
+  ref: string;            // "cve:CVE-..." or "ioc:<value>"
+  tlp: string;            // clear | green | amber | red
+  body: string;
+  createdAt: string;
+}
+
+export interface UserRecord extends User {
+  passwordHash: string;
+}
+
+function newId(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  return c?.randomUUID ? c.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+export interface AttackTechnique {
+  id: string;
+  count: number;
+  framework: "attack" | "atlas";
+}
+
+export interface ActorProfile {
+  /** Malware family / campaign label (the grouping key). */
+  name: string;
+  indicatorCount: number;
+  types: Record<string, number>;
+  sources: string[];
+  firstSeen: string | null;
+  lastSeen: string | null;
+  cves: string[];
+  techniques: string[];
+  sampleIocs: { value: string; type: string }[];
+}
+
+export interface AuditEntry {
+  id: string;
+  at: string;
+  user: string | null;
+  role: string | null;
+  action: string;
+  method: string;
+  path: string;
+  status: number | null;
+}
+
+// AML.T#### (ATLAS) must come first so it isn't split into a bare T####.
+const ATTACK_RE = /\bAML\.T\d{4}(?:\.\d{3})?\b|\bT\d{4}(?:\.\d{3})?\b/g;
+
+function tallyTechniques(haystacks: Iterable<string>, limit: number): AttackTechnique[] {
+  const counts = new Map<string, number>();
+  for (const hay of haystacks) {
+    const m = hay.match(ATTACK_RE);
+    if (!m) continue;
+    for (const raw of m) {
+      const id = raw.toUpperCase();
+      counts.set(id, (counts.get(id) ?? 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .map(([id, count]) => ({ id, count, framework: (id.startsWith("AML") ? "atlas" : "attack") as "attack" | "atlas" }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, limit);
+}
+
 const CVE_RE = /CVE-\d{4}-\d{4,}/gi;
+
+/** Aggregate indicators into per-malware-family actor/campaign profiles. */
+function buildActorProfiles(indicators: Iterable<Indicator>): ActorProfile[] {
+  const groups = new Map<string, {
+    name: string;
+    count: number;
+    types: Map<string, number>;
+    sources: Set<string>;
+    first: string | null;
+    last: string | null;
+    cves: Set<string>;
+    techniques: Set<string>;
+    samples: { value: string; type: string }[];
+  }>();
+  for (const i of indicators) {
+    const name = (i.malware ?? "").trim();
+    if (!name) continue;
+    const key = name.toLowerCase();
+    let g = groups.get(key);
+    if (!g) {
+      g = { name, count: 0, types: new Map(), sources: new Set(), first: null, last: null, cves: new Set(), techniques: new Set(), samples: [] };
+      groups.set(key, g);
+    }
+    g.count++;
+    g.types.set(i.type, (g.types.get(i.type) ?? 0) + 1);
+    g.sources.add(i.source);
+    if (i.firstSeen && (!g.first || i.firstSeen < g.first)) g.first = i.firstSeen;
+    if (i.lastSeen && (!g.last || i.lastSeen > g.last)) g.last = i.lastSeen;
+    const hay = `${i.value} ${i.malware ?? ""} ${i.threatType ?? ""} ${i.tags.join(" ")}`;
+    for (const c of hay.match(CVE_RE) ?? []) g.cves.add(c.toUpperCase());
+    for (const t of hay.match(ATTACK_RE) ?? []) g.techniques.add(t.toUpperCase());
+    if (g.samples.length < 10) g.samples.push({ value: i.value, type: i.type });
+  }
+  return [...groups.values()]
+    .map((g) => ({
+      name: g.name,
+      indicatorCount: g.count,
+      types: Object.fromEntries(g.types),
+      sources: [...g.sources],
+      firstSeen: g.first,
+      lastSeen: g.last,
+      cves: [...g.cves].slice(0, 25),
+      techniques: [...g.techniques].slice(0, 25),
+      sampleIocs: g.samples,
+    }))
+    .sort((a, b) => b.indicatorCount - a.indicatorCount);
+}
 
 export interface AdvisoryListOptions {
   limit?: number;
@@ -116,11 +230,25 @@ export interface Repository {
   page(opts?: ListOptions): Promise<Page>;
   upsertIndicators(items: Indicator[]): Promise<number>;
   pageIndicators(opts?: IndicatorListOptions): Promise<IndicatorPage>;
+  /** Delete indicators last seen older than `days` (decay). Returns count removed. */
+  pruneStaleIndicators(days: number): Promise<number>;
   upsertAdvisories(items: Advisory[]): Promise<number>;
   pageAdvisories(opts?: AdvisoryListOptions): Promise<AdvisoryPage>;
   listWatchlist(): Promise<string[]>;
   addWatchTerm(term: string): Promise<void>;
   removeWatchTerm(term: string): Promise<void>;
+  /** Stack-affecting, alert-worthy vulns not yet alerted. */
+  pendingStackAlerts(minRisk?: number): Promise<Vulnerability[]>;
+  markAlerted(keys: string[]): Promise<void>;
+  listNotes(ref: string): Promise<Note[]>;
+  addNote(ref: string, tlp: string, body: string): Promise<Note>;
+  deleteNote(id: string): Promise<void>;
+  getUserByUsername(username: string): Promise<UserRecord | null>;
+  createUser(username: string, passwordHash: string, role: Role): Promise<User>;
+  listUsers(): Promise<User[]>;
+  setUserRole(id: string, role: Role): Promise<void>;
+  deleteUser(id: string): Promise<void>;
+  countUsers(): Promise<number>;
   /** Distinct IP-indicator values still missing geolocation. */
   ipsNeedingGeo(limit?: number): Promise<string[]>;
   /** Apply geolocation to all indicator rows sharing a value. */
@@ -131,6 +259,16 @@ export interface Repository {
   mapIndicators(country: string, limit?: number): Promise<MapIndicator[]>;
   /** CVE references found inside indicators, linked to tracked CVEs where possible. */
   cveCorrelations(limit?: number): Promise<Correlation[]>;
+  /** ATT&CK / ATLAS technique IDs referenced across ingested intel, by frequency. */
+  attackTechniques(limit?: number): Promise<AttackTechnique[]>;
+  /** Indicators aggregated by malware family into actor/campaign profiles. */
+  actorProfiles(limit?: number): Promise<ActorProfile[]>;
+  /** One actor/campaign profile by malware family name. */
+  actorProfile(name: string): Promise<ActorProfile | null>;
+  /** Append an audit-log entry (who did what). */
+  appendAudit(entry: Omit<AuditEntry, "id" | "at">): Promise<void>;
+  /** Recent audit-log entries, newest first. */
+  listAudit(limit?: number): Promise<AuditEntry[]>;
   upsertSource(source: Source): Promise<void>;
   listSources(): Promise<Source[]>;
   stats(): Promise<Stats>;
@@ -213,9 +351,102 @@ export class InMemoryRepository implements Repository {
     this.watch.delete(term.trim().toLowerCase());
   }
 
+  private alertLog = new Set<string>();
+
+  async pendingStackAlerts(minRisk = 75): Promise<Vulnerability[]> {
+    const terms = [...this.watch];
+    if (terms.length === 0) return [];
+    const out: Vulnerability[] = [];
+    for (const v of this.vulns.values()) {
+      if (!matchesTerms(v, terms)) continue;
+      if (!(v.knownExploited || v.riskScore >= minRisk)) continue;
+      if (this.alertLog.has(`${v.source}:${v.id}`)) continue;
+      out.push(v);
+    }
+    return out.sort((a, b) => b.riskScore - a.riskScore);
+  }
+
+  async markAlerted(keys: string[]): Promise<void> {
+    for (const k of keys) this.alertLog.add(k);
+  }
+
+  private notes = new Map<string, Note>();
+  async listNotes(ref: string): Promise<Note[]> {
+    return [...this.notes.values()].filter((n) => n.ref === ref).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+  async addNote(ref: string, tlp: string, body: string): Promise<Note> {
+    const note: Note = { id: newId(), ref, tlp, body, createdAt: new Date().toISOString() };
+    this.notes.set(note.id, note);
+    return note;
+  }
+  async deleteNote(id: string): Promise<void> {
+    this.notes.delete(id);
+  }
+
+  private users = new Map<string, UserRecord>();
+  async getUserByUsername(username: string): Promise<UserRecord | null> {
+    return [...this.users.values()].find((u) => u.username === username) ?? null;
+  }
+  async createUser(username: string, passwordHash: string, role: Role): Promise<User> {
+    const rec: UserRecord = { id: newId(), username, passwordHash, role, createdAt: new Date().toISOString() };
+    this.users.set(rec.id, rec);
+    return { id: rec.id, username, role, createdAt: rec.createdAt };
+  }
+  async listUsers(): Promise<User[]> {
+    return [...this.users.values()].map((u) => ({ id: u.id, username: u.username, role: u.role, createdAt: u.createdAt }));
+  }
+  async setUserRole(id: string, role: Role): Promise<void> {
+    const u = this.users.get(id);
+    if (u) u.role = role;
+  }
+  async deleteUser(id: string): Promise<void> {
+    this.users.delete(id);
+  }
+  async countUsers(): Promise<number> {
+    return this.users.size;
+  }
+
+  async attackTechniques(limit = 60): Promise<AttackTechnique[]> {
+    const hays: string[] = [];
+    for (const a of this.advisories.values()) hays.push(`${a.title} ${a.summary} ${a.category ?? ""} ${a.tags.join(" ")}`);
+    for (const i of this.indicators.values()) hays.push(`${i.value} ${i.malware ?? ""} ${i.threatType ?? ""} ${i.tags.join(" ")}`);
+    return tallyTechniques(hays, limit);
+  }
+
+  async actorProfiles(limit = 60): Promise<ActorProfile[]> {
+    return buildActorProfiles(this.indicators.values()).slice(0, limit);
+  }
+
+  async actorProfile(name: string): Promise<ActorProfile | null> {
+    const key = name.trim().toLowerCase();
+    const rows = [...this.indicators.values()].filter((i) => (i.malware ?? "").trim().toLowerCase() === key);
+    return buildActorProfiles(rows)[0] ?? null;
+  }
+
+  private audit: AuditEntry[] = [];
+  async appendAudit(entry: Omit<AuditEntry, "id" | "at">): Promise<void> {
+    this.audit.unshift({ ...entry, id: newId(), at: new Date().toISOString() });
+    if (this.audit.length > 1000) this.audit.length = 1000;
+  }
+  async listAudit(limit = 200): Promise<AuditEntry[]> {
+    return this.audit.slice(0, limit);
+  }
+
   async upsertIndicators(items: Indicator[]): Promise<number> {
     for (const i of items) this.indicators.set(`${i.source}:${i.id}`, i);
     return items.length;
+  }
+
+  async pruneStaleIndicators(days: number): Promise<number> {
+    const cutoff = Date.now() - days * 86400000;
+    let removed = 0;
+    for (const [key, i] of this.indicators) {
+      if (i.lastSeen && new Date(i.lastSeen).getTime() < cutoff) {
+        this.indicators.delete(key);
+        removed++;
+      }
+    }
+    return removed;
   }
 
   async ipsNeedingGeo(limit = 200): Promise<string[]> {
@@ -301,6 +532,10 @@ export class InMemoryRepository implements Repository {
           (i.malware ?? "").toLowerCase().includes(q) ||
           (i.threatType ?? "").toLowerCase().includes(q),
       );
+    }
+    if (opts.maxAgeDays) {
+      const cutoff = Date.now() - opts.maxAgeDays * 86400000;
+      rows = rows.filter((i) => !i.lastSeen || new Date(i.lastSeen).getTime() >= cutoff);
     }
     const dir = opts.dir === "asc" ? 1 : -1;
     const val = (i: Indicator): string | number | null => {
@@ -548,15 +783,102 @@ export class PostgresRepository implements Repository {
     await this.pool.query(`DELETE FROM watchlist WHERE term = $1`, [term.trim().toLowerCase()]);
   }
 
+  async pendingStackAlerts(minRisk = 75): Promise<Vulnerability[]> {
+    const terms = await this.listWatchlist();
+    if (terms.length === 0) return [];
+    const params: unknown[] = [];
+    const ors = terms.map((t) => {
+      params.push(`%${t}%`);
+      const p = `$${params.length}`;
+      return `(vendor ILIKE ${p} OR product ILIKE ${p} OR title ILIKE ${p})`;
+    });
+    params.push(minRisk);
+    const sql = `SELECT * FROM vulnerabilities
+                 WHERE (${ors.join(" OR ")})
+                   AND (known_exploited = TRUE OR risk_score >= $${params.length})
+                   AND (source || ':' || id) NOT IN (SELECT id FROM alert_log)
+                 ORDER BY risk_score DESC LIMIT 100`;
+    const { rows } = await this.pool.query(sql, params);
+    return rows.map(rowToVuln);
+  }
+
+  async markAlerted(keys: string[]): Promise<void> {
+    if (keys.length === 0) return;
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (const k of keys) {
+        await client.query(`INSERT INTO alert_log (id) VALUES ($1) ON CONFLICT DO NOTHING`, [k]);
+      }
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async listNotes(ref: string): Promise<Note[]> {
+    const { rows } = await this.pool.query(`SELECT * FROM notes WHERE ref = $1 ORDER BY created_at DESC`, [ref]);
+    return rows.map((r) => ({
+      id: r.id as string,
+      ref: r.ref as string,
+      tlp: r.tlp as string,
+      body: r.body as string,
+      createdAt: new Date(r.created_at as string).toISOString(),
+    }));
+  }
+  async addNote(ref: string, tlp: string, body: string): Promise<Note> {
+    const id = newId();
+    const { rows } = await this.pool.query(
+      `INSERT INTO notes (id, ref, tlp, body) VALUES ($1,$2,$3,$4) RETURNING created_at`,
+      [id, ref, tlp, body],
+    );
+    return { id, ref, tlp, body, createdAt: new Date(rows[0].created_at as string).toISOString() };
+  }
+  async deleteNote(id: string): Promise<void> {
+    await this.pool.query(`DELETE FROM notes WHERE id = $1`, [id]);
+  }
+
+  async getUserByUsername(username: string): Promise<UserRecord | null> {
+    const { rows } = await this.pool.query(`SELECT * FROM users WHERE username = $1`, [username]);
+    if (rows.length === 0) return null;
+    const r = rows[0];
+    return { id: r.id, username: r.username, role: r.role, passwordHash: r.password_hash, createdAt: new Date(r.created_at).toISOString() };
+  }
+  async createUser(username: string, passwordHash: string, role: Role): Promise<User> {
+    const id = newId();
+    const { rows } = await this.pool.query(
+      `INSERT INTO users (id, username, password_hash, role) VALUES ($1,$2,$3,$4) RETURNING created_at`,
+      [id, username, passwordHash, role],
+    );
+    return { id, username, role, createdAt: new Date(rows[0].created_at).toISOString() };
+  }
+  async listUsers(): Promise<User[]> {
+    const { rows } = await this.pool.query(`SELECT id, username, role, created_at FROM users ORDER BY username`);
+    return rows.map((r) => ({ id: r.id, username: r.username, role: r.role, createdAt: new Date(r.created_at).toISOString() }));
+  }
+  async setUserRole(id: string, role: Role): Promise<void> {
+    await this.pool.query(`UPDATE users SET role = $2 WHERE id = $1`, [id, role]);
+  }
+  async deleteUser(id: string): Promise<void> {
+    await this.pool.query(`DELETE FROM users WHERE id = $1`, [id]);
+  }
+  async countUsers(): Promise<number> {
+    const { rows } = await this.pool.query(`SELECT COUNT(*)::int AS n FROM users`);
+    return rows[0].n as number;
+  }
+
   async upsertSource(s: Source): Promise<void> {
     await this.pool.query(
-      `INSERT INTO sources (id,name,kind,signal_type,url,schedule,enabled,requires_auth,config)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      `INSERT INTO sources (id,name,kind,signal_type,url,schedule,enabled,requires_auth,reliability,config)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
        ON CONFLICT (id) DO UPDATE SET
          name=EXCLUDED.name, kind=EXCLUDED.kind, signal_type=EXCLUDED.signal_type,
          url=EXCLUDED.url, schedule=EXCLUDED.schedule, enabled=EXCLUDED.enabled,
-         requires_auth=EXCLUDED.requires_auth, config=EXCLUDED.config`,
-      [s.id, s.name, s.kind, s.signalType, s.url, s.schedule, s.enabled, s.requiresAuth, s.config],
+         requires_auth=EXCLUDED.requires_auth, reliability=EXCLUDED.reliability, config=EXCLUDED.config`,
+      [s.id, s.name, s.kind, s.signalType, s.url, s.schedule, s.enabled, s.requiresAuth, s.reliability, s.config],
     );
   }
 
@@ -571,6 +893,7 @@ export class PostgresRepository implements Repository {
       schedule: r.schedule,
       enabled: r.enabled,
       requiresAuth: r.requires_auth,
+      reliability: (r.reliability as Source["reliability"]) ?? "C",
       config: r.config,
     }));
   }
@@ -733,6 +1056,10 @@ export class PostgresRepository implements Repository {
       params.push(`%${opts.q}%`);
       where.push(`(value ILIKE $${params.length} OR malware ILIKE $${params.length} OR threat_type ILIKE $${params.length})`);
     }
+    if (opts.maxAgeDays) {
+      params.push(opts.maxAgeDays);
+      where.push(`(last_seen IS NULL OR last_seen >= now() - ($${params.length} || ' days')::interval)`);
+    }
     const clause = where.length ? "WHERE " + where.join(" AND ") : "";
     const countRes = await this.pool.query(`SELECT COUNT(*)::int AS total FROM indicators ${clause}`, params);
     const total = countRes.rows[0].total as number;
@@ -794,6 +1121,14 @@ export class PostgresRepository implements Repository {
     const sql = `SELECT * FROM advisories ${clause} ORDER BY published DESC NULLS LAST, id LIMIT ${li} OFFSET ${oi}`;
     const { rows } = await this.pool.query(sql, paged);
     return { items: rows.map(rowToAdvisory), total };
+  }
+
+  async pruneStaleIndicators(days: number): Promise<number> {
+    const res = await this.pool.query(
+      `DELETE FROM indicators WHERE last_seen IS NOT NULL AND last_seen < now() - ($1 || ' days')::interval`,
+      [days],
+    );
+    return res.rowCount ?? 0;
   }
 
   async ipsNeedingGeo(limit = 200): Promise<string[]> {
@@ -874,6 +1209,65 @@ export class PostgresRepository implements Repository {
     });
     out.sort((a, b) => (b.riskScore ?? -1) - (a.riskScore ?? -1) || b.indicators.length - a.indicators.length);
     return out.slice(0, limit);
+  }
+
+  async attackTechniques(limit = 60): Promise<AttackTechnique[]> {
+    const hays: string[] = [];
+    const adv = await this.pool.query(`SELECT title, summary, category, tags FROM advisories LIMIT 5000`);
+    for (const r of adv.rows) {
+      const tags = Array.isArray(r.tags) ? (r.tags as string[]).join(" ") : "";
+      hays.push(`${r.title} ${r.summary ?? ""} ${r.category ?? ""} ${tags}`);
+    }
+    const ioc = await this.pool.query(
+      `SELECT value, malware, threat_type, tags FROM indicators
+         WHERE tags::text ~ 'T[0-9]{4}' OR threat_type ~ 'T[0-9]{4}' OR malware ~ 'T[0-9]{4}'
+         LIMIT 5000`,
+    );
+    for (const r of ioc.rows) {
+      const tags = Array.isArray(r.tags) ? (r.tags as string[]).join(" ") : "";
+      hays.push(`${r.value} ${r.malware ?? ""} ${r.threat_type ?? ""} ${tags}`);
+    }
+    return tallyTechniques(hays, limit);
+  }
+
+  async actorProfiles(limit = 60): Promise<ActorProfile[]> {
+    const { rows } = await this.pool.query(
+      `SELECT * FROM indicators WHERE malware IS NOT NULL AND malware <> '' LIMIT 20000`,
+    );
+    return buildActorProfiles(rows.map(rowToIndicator)).slice(0, limit);
+  }
+
+  async actorProfile(name: string): Promise<ActorProfile | null> {
+    const { rows } = await this.pool.query(
+      `SELECT * FROM indicators WHERE LOWER(TRIM(malware)) = LOWER(TRIM($1)) LIMIT 20000`,
+      [name],
+    );
+    return buildActorProfiles(rows.map(rowToIndicator))[0] ?? null;
+  }
+
+  async appendAudit(entry: Omit<AuditEntry, "id" | "at">): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO audit_log (id, username, role, action, method, path, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [newId(), entry.user, entry.role, entry.action, entry.method, entry.path, entry.status],
+    );
+  }
+
+  async listAudit(limit = 200): Promise<AuditEntry[]> {
+    const { rows } = await this.pool.query(
+      `SELECT * FROM audit_log ORDER BY at DESC LIMIT $1`,
+      [Math.min(limit, 1000)],
+    );
+    return rows.map((r) => ({
+      id: r.id as string,
+      at: new Date(r.at as string).toISOString(),
+      user: (r.username as string) ?? null,
+      role: (r.role as string) ?? null,
+      action: r.action as string,
+      method: r.method as string,
+      path: r.path as string,
+      status: r.status != null ? Number(r.status) : null,
+    }));
   }
 
   async stats(): Promise<Stats> {
