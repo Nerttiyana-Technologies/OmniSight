@@ -46,9 +46,9 @@ jobs:
       - name: Disable Jekyll processing
         run: touch apps/web/dist/.nojekyll
 
+      # Pages must be enabled once manually: Settings → Pages → Source: "GitHub Actions".
+      # (The default token usually can't create the Pages site programmatically.)
       - uses: actions/configure-pages@v5
-        with:
-          enablement: true
 
       - uses: actions/upload-pages-artifact@v3
         with:
