@@ -4,6 +4,7 @@ import type {
 } from "@omnisight/shared";
 
 export type { Asset, NewAsset, MonitorEvent, ScanTarget, Scan, ScanFinding } from "@omnisight/shared";
+import { DEMO, demoFetch } from "./demo.ts";
 
 export interface Stats {
   total: number;
@@ -311,6 +312,7 @@ export function streamToken(): string { return token ? `?token=${encodeURICompon
 
 /** fetch with the bearer token attached when present. */
 function af(input: string, init: RequestInit = {}): Promise<Response> {
+  if (DEMO) return demoFetch(input, init); // static demo: serve from bundled dataset
   const headers = new Headers(init.headers);
   if (token) headers.set("authorization", `Bearer ${token}`);
   return baseFetch(input, { ...init, headers });
@@ -513,6 +515,8 @@ export const api = {
   findingStats: () => af("/api/findings/stats").then(json<FindingStats>),
   /** Open the SSE stream. Returns the EventSource so callers can close it. */
   stream: (onUpdate: () => void, onError: () => void): EventSource => {
+    // Static demo has no live stream — return an inert handle the caller can close.
+    if (DEMO) return { close() {} } as unknown as EventSource;
     const es = new EventSource(`/api/stream${streamToken()}`);
     es.onmessage = () => onUpdate();
     es.onerror = () => onError();

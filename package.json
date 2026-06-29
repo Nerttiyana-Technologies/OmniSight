@@ -13,7 +13,8 @@
     "typecheck": "turbo run typecheck",
     "start:api": "pnpm --filter @omnisight/api start",
     "start:worker": "pnpm --filter @omnisight/worker start",
-    "connector:dry-run": "pnpm --filter @omnisight/connectors dry-run"
+    "connector:dry-run": "pnpm --filter @omnisight/connectors dry-run",
+    "build:demo": "bash scripts/build-demo.sh"
   },
   "devDependencies": {
     "turbo": "^2.3.3",

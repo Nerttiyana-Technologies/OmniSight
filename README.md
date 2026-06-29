@@ -28,6 +28,7 @@ feeds (optional keys unlock premium sources), starts with a single `docker compo
 
 ## Table of contents
 
+- [Live demo](#live-demo)
 - [Why OmniSight](#why-omnisight)
 - [Feature tour](#feature-tour)
   - [Phase 1 — Threat-intel dashboard](#phase-1--threat-intel-dashboard)
@@ -46,6 +47,19 @@ feeds (optional keys unlock premium sources), starts with a single `docker compo
 - [Contributing](#contributing)
 - [Security & responsible use](#security--responsible-use)
 - [License](#license)
+
+## Live demo
+
+A static, **read-only** demo runs on GitHub Pages — no backend, no database, no
+keys — so you can click through the dashboard (Overview, Vulnerabilities,
+Indicators, Assets, Monitoring, Scanning, Actors, Map, News) with curated sample
+data:
+
+**https://nerttiyana-technologies.github.io/OmniSight/**
+
+> The demo serves bundled fixtures instead of the live API (writes are no-ops and
+> there are no real-time updates). For the full experience — live ingestion,
+> enrichment, scanning, and alerts — run it locally or self-host (below).
 
 ## Why OmniSight
 
@@ -285,6 +299,32 @@ runs with zero API keys on public feeds; optional keys unlock premium sources. F
 `REDIS_URL`, enable auth (`AUTH_ENABLED`, `JWT_SECRET`, admin seed), and configure SMTP for the daily brief. The scaling
 path (only if needed) is partitioning high-volume tables, adding OpenSearch as a read replica for search, and API read
 replicas — none required to start.
+
+### Static demo on GitHub Pages (free)
+
+The dashboard can be published as a **static, read-only** site with no backend —
+ideal for a free public demo. When built with `VITE_DEMO=true`, the API client
+serves bundled sample data instead of calling `/api/*` (see
+[`apps/web/src/demo.ts`](apps/web/src/demo.ts)).
+
+Automated deploy (recommended): the [`Deploy demo to GitHub Pages`](.github/workflows/deploy-pages.yml)
+workflow builds and publishes on every push to `main`. Enable it once under
+**Settings → Pages → Build and deployment → Source: GitHub Actions**. It derives
+the project base path from the repo name automatically, so forks work unchanged.
+
+Build it yourself (any static host):
+
+```bash
+# Outputs apps/web/dist — upload anywhere (Pages, Netlify, S3, nginx…)
+pnpm build:demo                       # root path "/"
+VITE_BASE=/OmniSight/ pnpm build:demo # under a GitHub Pages project path
+pnpm --filter @omnisight/web preview  # preview the built demo locally
+```
+
+This is **GitHub-Pages-free** (static hosting on public repos costs nothing). A
+true live demo needs the Node API/worker + Postgres, which GitHub doesn't host —
+use a small PaaS (Render, Railway, Fly.io) or a VPS for that, with the frontend
+pointed at your API.
 
 ## Roadmap
 
