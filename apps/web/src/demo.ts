@@ -9,10 +9,13 @@ import {
   type Vulnerability, type Indicator, type Advisory,
 } from "@omnisight/shared";
 
-/** True when running the static demo (Pages build, or VITE_DEMO=true). */
+/**
+ * True when running the static demo. Driven solely by the build-time flag
+ * (the Pages workflow and `pnpm build:demo` set VITE_DEMO=true) — deliberately
+ * not inferred from the hostname, which is unsafe to match by substring.
+ */
 export const DEMO: boolean =
-  ((import.meta as unknown as { env?: Record<string, string> }).env?.VITE_DEMO === "true") ||
-  (typeof location !== "undefined" && location.hostname.endsWith("github.io"));
+  (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_DEMO === "true";
 
 const NOW = new Date().toISOString();
 const daysAgo = (n: number) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
