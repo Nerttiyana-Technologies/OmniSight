@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
+import rateLimit from "@fastify/rate-limit";
 import {
   NewSourceSchema, SourceSchema, IndicatorSchema, type Source, type Indicator,
   vulnerabilitiesToCsv, indicatorsToCsv, indicatorsToStix, indicatorsToBlocklist, indicatorsToSigma,
@@ -82,6 +83,12 @@ async function bootstrap() {
 
 const app = Fastify({ logger: true, bodyLimit: 20 * 1024 * 1024 }); // SBOMs/log uploads can be large
 await app.register(cors, { origin: true });
+
+// Global rate limiting (per-IP). Tunable via env; protects every route from abuse.
+await app.register(rateLimit, {
+  max: Number(process.env.RATE_LIMIT_MAX ?? 300),
+  timeWindow: process.env.RATE_LIMIT_WINDOW ?? "1 minute",
+});
 
 // Accept raw text bodies for CSV asset imports and plain-text log/event uploads.
 app.addContentTypeParser(["text/plain", "text/csv", "application/x-ndjson"], { parseAs: "string" }, (_req, body, done) => done(null, body));

@@ -41,6 +41,24 @@ const SERVICE_NOTE: Record<string, string> = {
 
 function timeoutMs(ctx?: ScanContext): number { return ctx?.timeoutMs ?? 1500; }
 
+/**
+ * SSRF posture: this scanner intentionally connects to operator-supplied targets
+ * (scanning your own hosts is the whole point), it is gated behind an authorized
+ * analyst action, and httpGrab uses redirect:"manual" so it can't be bounced to
+ * an internal resource. As defense-in-depth we always refuse cloud-metadata /
+ * link-local addresses (never a legitimate scan target and the classic SSRF
+ * pivot), and can refuse all private ranges when SCANNER_BLOCK_PRIVATE=true.
+ */
+function isBlockedTarget(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "metadata.google.internal" || h === "169.254.169.254" || /^169\.254\./.test(h) || h === "fd00:ec2::254") return true;
+  if (process.env.SCANNER_BLOCK_PRIVATE === "true") {
+    if (h === "localhost" || /^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h) ||
+        /^172\.(1[6-9]|2\d|3[01])\./.test(h) || h === "::1" || /^fe80:/.test(h) || /^f[cd]/.test(h)) return true;
+  }
+  return false;
+}
+
 /** Resolve a TCP open/closed result for one port. */
 function probePort(host: string, port: number, ms: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -158,6 +176,15 @@ export const builtinScanner: ScanAdapter = {
     const concurrency = ctx?.concurrency ?? 40;
     const findings: RawScanFinding[] = [];
     const { host, httpUrls } = hostFromTarget(input);
+
+    if (isBlockedTarget(host)) {
+      return [{
+        target: input.target, host, port: null, service: null, product: null, version: null,
+        cpe: null, cve: null, severity: "info", title: "Scan target blocked by SSRF guard",
+        description: `${host} is a cloud-metadata/link-local address (or a private address while SCANNER_BLOCK_PRIVATE=true) and was not scanned.`,
+        evidence: null,
+      }];
+    }
 
     if (input.kind === "url") {
       for (const u of httpUrls) findings.push(...(await httpGrab(u.url, host, u.port, ms)));
