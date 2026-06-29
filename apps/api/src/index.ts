@@ -96,7 +96,7 @@ app.addContentTypeParser(["text/plain", "text/csv", "application/x-ndjson"], { p
 // --- Auth + RBAC gate (only active when AUTH_ENABLED) ---
 app.addHook("onRequest", async (req, reply) => {
   if (!AUTH_ENABLED) return;
-  const url = (req.raw.url ?? "").split("?")[0];
+  const url = (req.raw.url ?? "").split("?")[0] ?? "";
   if (url === "/health" || url === "/api/auth/login" || url === "/api/auth/config") return;
   if (url === "/api/auth/sso/login" || url === "/api/auth/sso/callback") return;
 
@@ -119,7 +119,7 @@ app.addHook("onRequest", async (req, reply) => {
 // --- Audit log: record mutating actions (and logins) when auth is enabled ---
 app.addHook("onResponse", async (req, reply) => {
   if (!AUTH_ENABLED) return;
-  const url = (req.raw.url ?? "").split("?")[0];
+  const url = (req.raw.url ?? "").split("?")[0] ?? "";
   const write = !["GET", "HEAD", "OPTIONS"].includes(req.method);
   const isLogin = url === "/api/auth/login";
   if (!write && !isLogin) return;
@@ -326,7 +326,7 @@ app.get("/api/mentions", async () => {
   for (const term of terms) {
     const [adv, ioc] = await Promise.all([
       repo.pageAdvisories({ q: term, limit: 25 }),
-      repo.pageIndicators({ q: term, pageSize: 25 }),
+      repo.pageIndicators({ q: term, limit: 25 }),
     ]);
     if (adv.items.length === 0 && ioc.items.length === 0) continue;
     out.push({
@@ -433,7 +433,7 @@ app.get("/api/typosquat", async () => {
     const name = brand.slice(0, brand.indexOf("."));
     // Look-alikes already in our intel: domain indicators containing the brand
     // name but not the official domain itself.
-    const page = await repo.pageIndicators({ type: "domain", q: name, pageSize: 100 });
+    const page = await repo.pageIndicators({ type: "domain", q: name, limit: 100 });
     const seen = page.items
       .filter((i) => i.value.toLowerCase() !== brand.toLowerCase() && i.value.toLowerCase().includes(name.toLowerCase()))
       .map((i) => ({ value: i.value, source: i.source, malware: i.malware }));
