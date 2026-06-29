@@ -4,7 +4,7 @@ import {
   Activity, Gauge, ChevronLeft, ChevronRight, Crosshair, Server, X, Download, FileText, Newspaper, ExternalLink,
   ScanSearch, Copy, Package, LogOut, Users as UsersIcon, Lock, Trash2, Sparkles, ScrollText, Bug, KeyRound,
   Workflow, Link2, ShieldOff, Bookmark, ThumbsUp, ThumbsDown, Globe, Power, Play,
-  ShieldCheck, Grid3x3, Layers, HelpCircle,
+  ShieldCheck, Grid3x3, Layers, HelpCircle, HardDrive, Radio, Target, Upload,
 } from "lucide-react";
 import {
   riskBand, threatLevel, extractIocs, defang, roleAtLeast, reliabilityWeight, type Vulnerability, type Indicator, type Advisory, type NewSource, type Source,
@@ -14,11 +14,13 @@ import {
   api, setToken, type Stats, type VulnQuery, type IndicatorQuery, type AdvisoryQuery, type MapPoint, type MapIndicator,
   type Correlation, type AttackTechnique, type ActorProfile, type AuditEntry, type Breach, type Rule, type AiLink,
   type SavedSearch, type Verdict, type TyposquatGroup,
+  type AssetMatch, type MonitorEvent, type ScanTarget, type Scan, type ScanFinding,
+  type EventStats, type ScanAdapterInfo, type AssetPage, type EventPage,
 } from "./api.ts";
 import { makeProjector, topologyToGeometries, geomToPath, type Geom } from "./geo.ts";
 
 type Theme = "dark" | "light";
-type Tab = "overview" | "vulns" | "iocs" | "actors" | "exposure" | "news" | "map";
+type Tab = "overview" | "vulns" | "iocs" | "assets" | "monitoring" | "scanning" | "actors" | "exposure" | "news" | "map";
 
 function toneBadgeClass(tone?: DigestTone): string {
   return tone && tone !== "info" ? tone : "info";
@@ -191,12 +193,6 @@ export function App() {
           </div>
         </div>
         <div className="spacer" />
-        {authEnabled && me && (
-          <div className="user-chip" title={`Signed in as ${me.username}`}>
-            <span className="user-name">{me.username}</span>
-            <span className={`badge rel-${me.role === "admin" ? "A" : me.role === "analyst" ? "B" : "C"}`}>{me.role}</span>
-          </div>
-        )}
         {aiEnabled && (
           <button className="icon-btn" data-tooltip="Ask AI" aria-label="Ask AI" onClick={() => setShowAsk(true)}>
             <Sparkles size={18} />
@@ -241,11 +237,7 @@ export function App() {
             <UsersIcon size={18} />
           </button>
         )}
-        {authEnabled && me && (
-          <button className="icon-btn" data-tooltip="Sign out" aria-label="Sign out" onClick={logout}>
-            <LogOut size={18} />
-          </button>
-        )}
+
         <div className="live-status" title={live ? "Auto-refreshing" : "Auto-refresh paused"}>
           <span className={`live-dot ${live ? "on" : "off"}`} />
           <span className="live-text">
@@ -320,6 +312,17 @@ export function App() {
         >
           {theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}
         </button>
+        {authEnabled && me && (
+            <div className="user-chip" title={`Signed in as ${me.username}`}>
+              <span className="user-name">{me.username}</span>
+              <span className={`badge rel-${me.role === "admin" ? "A" : me.role === "analyst" ? "B" : "C"}`}>{me.role}</span>
+            </div>
+        )}
+        {authEnabled && me && (
+            <button className="icon-btn" data-tooltip="Sign out" aria-label="Sign out" onClick={logout}>
+              <LogOut size={18} />
+            </button>
+        )}
       </header>
 
       <main>
@@ -332,6 +335,9 @@ export function App() {
           <StatCard icon={<Crosshair size={16} />} label="Indicators" value={stats?.indicators} />
           <StatCard icon={<Newspaper size={16} />} label="News" value={stats?.advisories} />
           <StatCard icon={<Server size={16} />} label="My Stack" value={stats?.inStack} accent />
+          <StatCard icon={<HardDrive size={16} />} label="Assets" value={stats?.assets} />
+          <StatCard icon={<Radio size={16} />} label="Event Hits" value={stats?.eventsMatched} accent />
+          <StatCard icon={<Target size={16} />} label="Scan Findings" value={stats?.findings} />
           <StatCard icon={<Rss size={16} />} label="Active Sources" value={stats?.sources} />
         </section>
 
@@ -347,6 +353,15 @@ export function App() {
           </button>
           <button className={`tab ${tab === "iocs" ? "active" : ""}`} onClick={() => setTab("iocs")}>
             Indicators {stats && <span className="muted">({stats.indicators.toLocaleString()})</span>}
+          </button>
+          <button className={`tab ${tab === "assets" ? "active" : ""}`} onClick={() => setTab("assets")}>
+            Assets {stats && <span className="muted">({stats.assets.toLocaleString()})</span>}
+          </button>
+          <button className={`tab ${tab === "monitoring" ? "active" : ""}`} onClick={() => setTab("monitoring")}>
+            Monitoring {stats && stats.eventsMatched > 0 && <span className="muted">({stats.eventsMatched.toLocaleString()})</span>}
+          </button>
+          <button className={`tab ${tab === "scanning" ? "active" : ""}`} onClick={() => setTab("scanning")}>
+            Scanning {stats && stats.findings > 0 && <span className="muted">({stats.findings.toLocaleString()})</span>}
           </button>
           <button className={`tab ${tab === "actors" ? "active" : ""}`} onClick={() => setTab("actors")}>
             Actors
@@ -365,6 +380,9 @@ export function App() {
         {tab === "overview" && <Overview reloadKey={reloadKey} stats={stats} />}
         {tab === "vulns" && <VulnGrid reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "vulnerability")} terms={terms} onDetail={onDetail} />}
         {tab === "iocs" && <IndicatorGrid reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "indicator")} onEnrich={onEnrich} canWrite={canWrite} />}
+        {tab === "assets" && <AssetsView reloadKey={reloadKey} canWrite={canWrite} />}
+        {tab === "monitoring" && <MonitoringView reloadKey={reloadKey} canWrite={canWrite} onEnrich={onEnrich} />}
+        {tab === "scanning" && <ScanningView reloadKey={reloadKey} canWrite={canWrite} />}
         {tab === "actors" && <ActorsView reloadKey={reloadKey} onEnrich={onEnrich} />}
         {tab === "exposure" && <ExposureView reloadKey={reloadKey} canWrite={canWrite} />}
         {tab === "news" && <NewsView reloadKey={reloadKey} sources={sources.filter((s) => s.signalType === "advisory")} />}
@@ -2643,7 +2661,7 @@ function AddFeed({ onAdded }: { onAdded: () => void }) {
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
   const [itemsPath, setItemsPath] = useState("");
-  const [feedKind, setFeedKind] = useState<"json" | "taxii">("json");
+  const [feedKind, setFeedKind] = useState<"json" | "taxii" | "rss">("json");
   const [taxiiUser, setTaxiiUser] = useState("");
   const [taxiiSecret, setTaxiiSecret] = useState("");
   const [sector, setSector] = useState("");
@@ -2662,12 +2680,18 @@ function AddFeed({ onAdded }: { onAdded: () => void }) {
       ? {
           name, kind: "taxii", signalType: "indicator", url,
           schedule: "0 */6 * * *", enabled: true, requiresAuth: Boolean(taxiiSecret),
-          sector: sec, config: taxiiConfig,
+          reliability: "C", sector: sec, config: taxiiConfig,
+        }
+      : feedKind === "rss"
+      ? {
+          name, kind: "rss", signalType: "advisory", url,
+          schedule: "0 */3 * * *", enabled: true, requiresAuth: false,
+          reliability: "C", sector: sec, config: {},
         }
       : {
           name, kind: "json", signalType: "vulnerability", url,
           schedule: "0 */6 * * *", enabled: true, requiresAuth: false,
-          sector: sec, config: { itemsPath, map: {} },
+          reliability: "C", sector: sec, config: { itemsPath, map: {} },
         };
     try {
       const created = await api.addSource(body);
@@ -2686,8 +2710,9 @@ function AddFeed({ onAdded }: { onAdded: () => void }) {
       <form onSubmit={submit}>
         <div className="field">
           <label>Feed type</label>
-          <select className="page-size" value={feedKind} onChange={(e) => setFeedKind(e.target.value as "json" | "taxii")}>
+          <select className="page-size" value={feedKind} onChange={(e) => setFeedKind(e.target.value as "json" | "taxii" | "rss")}>
             <option value="json">Generic JSON (vulnerabilities)</option>
+            <option value="rss">RSS / Atom (news &amp; advisories)</option>
             <option value="taxii">TAXII 2.1 (indicators)</option>
           </select>
         </div>
@@ -2700,8 +2725,8 @@ function AddFeed({ onAdded }: { onAdded: () => void }) {
           <input value={sector} onChange={(e) => setSector(e.target.value)} placeholder="e.g. finance, healthcare" />
         </div>
         <div className="field">
-          <label>{feedKind === "taxii" ? "Collection objects URL" : "JSON URL"}</label>
-          <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder={feedKind === "taxii" ? "https://server/taxii2/<root>/collections/<id>/objects/" : "https://example.com/feed.json"} required />
+          <label>{feedKind === "taxii" ? "Collection objects URL" : feedKind === "rss" ? "RSS / Atom feed URL" : "JSON URL"}</label>
+          <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder={feedKind === "taxii" ? "https://server/taxii2/<root>/collections/<id>/objects/" : feedKind === "rss" ? "https://feeds.arstechnica.com/arstechnica/security" : "https://example.com/feed.json"} required />
         </div>
         {feedKind === "json" && (
           <div className="field">
@@ -2726,8 +2751,404 @@ function AddFeed({ onAdded }: { onAdded: () => void }) {
       <div className="hint">
         {feedKind === "taxii"
           ? "Polls a TAXII 2.1 collection's objects endpoint and ingests STIX indicators on schedule."
+          : feedKind === "rss"
+          ? "RSS/Atom news feed — articles appear in the News tab. Try Ars Technica, BleepingComputer, KrebsOnSecurity, or any vendor advisory feed. No code required."
           : "Generic JSON connector — point it at any feed, set the array path, and OmniSight ingests it. No code required."}
         {msg && <span style={{ display: "block", marginTop: 6 }}>{msg}</span>}
+      </div>
+    </div>
+  );
+}
+
+// ===========================================================================
+// Phase 2 — Asset inventory
+// ===========================================================================
+
+const CRITICALITIES = ["low", "medium", "high", "critical"] as const;
+const ASSET_KINDS = ["software", "host", "service", "cloud", "network", "other"] as const;
+
+function AssetForm({ onAdded }: { onAdded: () => void }) {
+  const [name, setName] = useState("");
+  const [vendor, setVendor] = useState("");
+  const [product, setProduct] = useState("");
+  const [version, setVersion] = useState("");
+  const [cpe, setCpe] = useState("");
+  const [hostname, setHostname] = useState("");
+  const [criticality, setCriticality] = useState<(typeof CRITICALITIES)[number]>("medium");
+  const [kind, setKind] = useState<(typeof ASSET_KINDS)[number]>("software");
+  const [err, setErr] = useState("");
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    if (!name.trim()) { setErr("Name required."); return; }
+    try {
+      await api.createAsset({
+        name: name.trim(), vendor: vendor.trim() || null, product: product.trim() || null,
+        version: version.trim() || null, cpe: cpe.trim() || null, hostname: hostname.trim() || null,
+        criticality, kind, origin: "manual", tags: [],
+      });
+      setName(""); setVendor(""); setProduct(""); setVersion(""); setCpe(""); setHostname("");
+      onAdded();
+    } catch (er) { setErr((er as Error).message); }
+  }
+  return (
+    <form onSubmit={submit} className="rule-form" style={{ padding: "12px 16px", borderBottom: "1px solid var(--border)" }}>
+      <input className="note-input" placeholder="Name *" value={name} onChange={(e) => setName(e.target.value)} />
+      <input className="note-input" placeholder="Vendor" value={vendor} onChange={(e) => setVendor(e.target.value)} />
+      <input className="note-input" placeholder="Product" value={product} onChange={(e) => setProduct(e.target.value)} />
+      <input className="note-input rule-num" placeholder="Version" value={version} onChange={(e) => setVersion(e.target.value)} />
+      <input className="note-input" placeholder="CPE (cpe:2.3:a:vendor:product:…)" value={cpe} onChange={(e) => setCpe(e.target.value)} />
+      <input className="note-input" placeholder="Host / IP" value={hostname} onChange={(e) => setHostname(e.target.value)} />
+      <select className="page-size" value={kind} onChange={(e) => setKind(e.target.value as typeof kind)}>
+        {ASSET_KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
+      </select>
+      <select className="page-size" value={criticality} onChange={(e) => setCriticality(e.target.value as typeof criticality)}>
+        {CRITICALITIES.map((c) => <option key={c} value={c}>{c}</option>)}
+      </select>
+      <button className="btn-primary" type="submit"><Plus size={16} /> Add</button>
+      {err && <span className="login-error">{err}</span>}
+    </form>
+  );
+}
+
+function AssetsView({ reloadKey, canWrite }: { reloadKey: number; canWrite: boolean }) {
+  const [data, setData] = useState<AssetPage | null>(null);
+  const [matches, setMatches] = useState<AssetMatch[]>([]);
+  const [q, setQ] = useState("");
+  const [crit, setCrit] = useState("");
+  const [showForm, setShowForm] = useState(false);
+  const [msg, setMsg] = useState("");
+  const csvRef = useRef<HTMLInputElement>(null);
+  const sbomRef = useRef<HTMLInputElement>(null);
+
+  const load = useCallback(() => {
+    api.assets({ q: q || undefined, criticality: crit || undefined, pageSize: 200 }).then(setData).catch(() => setData(null));
+    api.assetMatches().then(setMatches).catch(() => setMatches([]));
+  }, [q, crit]);
+  useEffect(() => { load(); }, [load, reloadKey]);
+
+  async function importCsv(file: File) {
+    try { const r = await api.importAssetsCsv(await file.text()); setMsg(`Imported ${r.imported} asset(s) from CSV.`); load(); }
+    catch (e) { setMsg(`CSV import failed: ${(e as Error).message}`); }
+  }
+  async function importSbom(file: File) {
+    try { const obj = JSON.parse(await file.text()); const r = await api.importAssetsSbom(obj); setMsg(`Imported ${r.imported} asset(s) from ${r.components} SBOM component(s).`); load(); }
+    catch (e) { setMsg(`SBOM import failed: ${(e as Error).message}`); }
+  }
+
+  const matchBadge = (t: AssetMatch["matchType"]) => (t === "cpe" ? "rel-A" : t === "vendor-product" ? "rel-B" : "rel-C");
+
+  return (
+    <section className="panel">
+      <div className="grid-toolbar">
+        <div className="toolbar-title"><HardDrive size={16} /> Asset inventory <span className="muted">({data?.total ?? 0})</span></div>
+        <input className="note-input" style={{ maxWidth: 200 }} placeholder="Search assets…" value={q} onChange={(e) => setQ(e.target.value)} />
+        <select className="page-size" value={crit} onChange={(e) => setCrit(e.target.value)}>
+          <option value="">All criticality</option>
+          {CRITICALITIES.map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
+        <div className="spacer" />
+        {canWrite && <button className="icon-btn" data-tooltip="Add asset" aria-label="Add asset" onClick={() => setShowForm((v) => !v)}><Plus size={18} /></button>}
+        {canWrite && <button className="icon-btn" data-tooltip="Import CSV" aria-label="Import CSV" onClick={() => csvRef.current?.click()}><Upload size={18} /></button>}
+        {canWrite && <button className="icon-btn" data-tooltip="Import SBOM (CycloneDX/SPDX)" aria-label="Import SBOM" onClick={() => sbomRef.current?.click()}><Package size={18} /></button>}
+        <button className="icon-btn" data-tooltip="Export CSV" aria-label="Export CSV" onClick={() => download(api.exportAssetsUrl())}><Download size={18} /></button>
+        <button className="icon-btn" data-tooltip="Refresh" aria-label="Refresh" onClick={load}><RefreshCw size={18} /></button>
+        <input ref={csvRef} type="file" accept=".csv,text/csv" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) importCsv(f); e.target.value = ""; }} />
+        <input ref={sbomRef} type="file" accept=".json" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) importSbom(f); e.target.value = ""; }} />
+      </div>
+      {msg && <div className="hint" style={{ padding: "8px 16px" }}>{msg}</div>}
+      {showForm && canWrite && <AssetForm onAdded={() => { setShowForm(false); load(); }} />}
+      <div className="ov-list" style={{ padding: "4px 16px" }}>
+        {(!data || data.items.length === 0) && <div className="empty">No assets yet. Add one, import a CSV, or scan an SBOM — then incoming CVEs that affect them are flagged below and drive "My Stack".</div>}
+        {data?.items.map((a) => (
+          <div className="ov-row" key={a.id}>
+            <span className={`badge ${a.criticality}`}>{a.criticality}</span>
+            <div className="ov-row-text">
+              <div className="ov-primary">{a.name} {a.version && <span className="muted">· v{a.version}</span>} <span className="badge info" style={{ marginLeft: 6 }}>{a.origin}</span></div>
+              <div className="ov-secondary muted">
+                {[a.vendor, a.product].filter(Boolean).join(" / ") || "—"}
+                {a.cpe && <span className="mono"> · {a.cpe}</span>}
+                {(a.hostname || a.ip) && <span> · {a.hostname || a.ip}</span>}
+                {a.tags.length > 0 && <span> · {a.tags.join(", ")}</span>}
+              </div>
+            </div>
+            <div className="spacer" />
+            {canWrite && <button className="icon-btn danger" data-tooltip="Delete" aria-label="Delete asset" onClick={() => api.deleteAsset(a.id).then(load).catch(() => {})}><Trash2 size={16} /></button>}
+          </div>
+        ))}
+      </div>
+
+      <div className="grid-toolbar" style={{ marginTop: 10 }}>
+        <div className="toolbar-title"><ShieldAlert size={16} /> Vulnerabilities affecting your assets <span className="muted">({matches.length})</span></div>
+      </div>
+      <div style={{ padding: "4px 16px 12px" }}>
+        {matches.length === 0 && <div className="empty">No tracked CVEs currently match your assets.</div>}
+        {matches.map((m, i) => (
+          <div className="ov-row" key={i}>
+            <span className={`badge ${riskBand(m.riskScore)}`}>{m.riskScore}</span>
+            <div className="ov-row-text">
+              <div className="ov-primary">
+                <a href={`https://nvd.nist.gov/vuln/detail/${m.cve}`} target="_blank" rel="noopener noreferrer">{m.cve}</a>
+                {m.knownExploited && <span className="flag"> EXPLOITED</span>}
+                <span className="muted"> → {m.assetName}</span>
+              </div>
+              <div className="ov-secondary muted">{m.title}</div>
+              <div className="ov-secondary"><span className={`badge ${matchBadge(m.matchType)}`}>{m.matchType}</span> <span className="muted">{m.reason} · {m.criticality} asset</span></div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+// ===========================================================================
+// Phase 2 — Environment monitoring (events / IOC matching)
+// ===========================================================================
+
+function MonitoringView({ reloadKey, canWrite, onEnrich }: { reloadKey: number; canWrite: boolean; onEnrich: (value: string, type: string) => void }) {
+  const [data, setData] = useState<EventPage | null>(null);
+  const [stats, setStats] = useState<EventStats | null>(null);
+  const [matchedOnly, setMatchedOnly] = useState(false);
+  const [kind, setKind] = useState("");
+  const [q, setQ] = useState("");
+  const [text, setText] = useState("");
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(() => {
+    api.events({ matchedOnly, kind: kind || undefined, q: q || undefined, pageSize: 200 }).then(setData).catch(() => setData(null));
+    api.eventStats().then(setStats).catch(() => setStats(null));
+  }, [matchedOnly, kind, q]);
+  useEffect(() => { load(); }, [load, reloadKey]);
+
+  async function submit() {
+    if (!text.trim()) return;
+    setBusy(true); setMsg("");
+    try { const r = await api.ingestEventsText(text); setMsg(`Ingested ${r.inserted} observable(s) — ${r.matched} matched a tracked indicator.`); setText(""); load(); }
+    catch (e) { setMsg(`Ingest failed: ${(e as Error).message}`); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <section className="panel">
+      <div className="grid-toolbar">
+        <div className="toolbar-title"><Radio size={16} /> Environment monitoring <span className="muted">({data?.total ?? 0})</span></div>
+        {stats && <span className="muted" style={{ fontSize: 12 }}>{stats.matched} matched · {stats.last24h} in 24h</span>}
+        <div className="spacer" />
+        <button className={`chip ${matchedOnly ? "on" : ""}`} onClick={() => setMatchedOnly((v) => !v)}>Matched only</button>
+        <select className="page-size" value={kind} onChange={(e) => setKind(e.target.value)}>
+          <option value="">All types</option><option value="ip">ip</option><option value="domain">domain</option><option value="url">url</option><option value="hash">hash</option>
+        </select>
+        <input className="note-input" style={{ maxWidth: 180 }} placeholder="Search…" value={q} onChange={(e) => setQ(e.target.value)} />
+        <button className="icon-btn" data-tooltip="Refresh" aria-label="Refresh" onClick={load}><RefreshCw size={18} /></button>
+      </div>
+      {canWrite && (
+        <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border)" }}>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 6 }}>Paste log lines, NDJSON, or a JSON event — OmniSight extracts observables (IP/domain/URL/hash) and matches them against tracked indicators. Or POST to <code>/api/events</code> / point syslog at the worker.</div>
+          <textarea className="note-input" rows={3} style={{ width: "100%" }} placeholder='e.g. {"src_ip":"45.66.230.10","host":"web-01"}  — or a raw log line' value={text} onChange={(e) => setText(e.target.value)} />
+          <div style={{ marginTop: 8 }}>
+            <button className="btn-primary" disabled={busy} onClick={submit}><Radio size={16} /> Ingest event</button>
+            {msg && <span className="muted" style={{ marginLeft: 10 }}>{msg}</span>}
+          </div>
+        </div>
+      )}
+      <div style={{ padding: "4px 16px 12px" }}>
+        {(!data || data.items.length === 0) && <div className="empty">No environment events yet. Submit logs above, POST JSON to <code>/api/events</code>, or enable the syslog listener (<code>SYSLOG_ENABLED=true</code>).</div>}
+        {data?.items.map((ev: MonitorEvent) => (
+          <div className="ov-row" key={ev.id}>
+            <span className={`badge ${ev.matched ? ev.severity : "info"}`}>{ev.matched ? ev.severity : "no hit"}</span>
+            <div className="ov-row-text">
+              <div className="ov-primary mono">{defang(ev.value)} <span className="badge info" style={{ marginLeft: 6 }}>{ev.kind}</span></div>
+              <div className="ov-secondary muted">
+                {ev.sensor}{ev.host ? ` · ${ev.host}` : ""}
+                {ev.matched ? ` · matched ${ev.matchedSource ?? ""}${ev.malware ? " · " + ev.malware : ""}` : ""}
+                {` · ${formatDate(ev.observedAt ?? ev.createdAt)}`}
+              </div>
+            </div>
+            {ev.matched && ev.kind === "ip" && <button className="chip mini" onClick={() => onEnrich(ev.value, "ip")}>enrich</button>}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+// ===========================================================================
+// Phase 3 — Vulnerability scanning
+// ===========================================================================
+
+function scanStatusBadge(s: string): string {
+  return s === "done" ? "rel-A" : s === "running" ? "rel-B" : s === "error" ? "critical" : "info";
+}
+
+function ScanTargetForm({ adapters, onAdded }: { adapters: ScanAdapterInfo[]; onAdded: () => void }) {
+  const [name, setName] = useState("");
+  const [target, setTarget] = useState("");
+  const [kind, setKind] = useState<"host" | "url">("host");
+  const [adapter, setAdapter] = useState("builtin");
+  const [schedule, setSchedule] = useState("");
+  const [err, setErr] = useState("");
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    if (!name.trim() || !target.trim()) { setErr("Name and target required."); return; }
+    try {
+      await api.createScanTarget({ name: name.trim(), target: target.trim(), kind, adapter, schedule: schedule.trim() || null });
+      setName(""); setTarget(""); setSchedule("");
+      onAdded();
+    } catch (er) { setErr((er as Error).message); }
+  }
+  return (
+    <form onSubmit={submit} className="rule-form" style={{ padding: "12px 16px", borderBottom: "1px solid var(--border)" }}>
+      <input className="note-input" placeholder="Target name *" value={name} onChange={(e) => setName(e.target.value)} />
+      <input className="note-input" placeholder="host / IP / URL *" value={target} onChange={(e) => setTarget(e.target.value)} />
+      <select className="page-size" value={kind} onChange={(e) => setKind(e.target.value as "host" | "url")}>
+        <option value="host">host</option><option value="url">url</option>
+      </select>
+      <select className="page-size" value={adapter} onChange={(e) => setAdapter(e.target.value)}>
+        {adapters.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+      </select>
+      <input className="note-input rule-num" placeholder="cron (optional)" value={schedule} onChange={(e) => setSchedule(e.target.value)} />
+      <button className="btn-primary" type="submit"><Plus size={16} /> Add target</button>
+      {err && <span className="login-error">{err}</span>}
+    </form>
+  );
+}
+
+function ScanningView({ reloadKey, canWrite }: { reloadKey: number; canWrite: boolean }) {
+  const [targets, setTargets] = useState<ScanTarget[]>([]);
+  const [scans, setScans] = useState<Scan[]>([]);
+  const [adapters, setAdapters] = useState<ScanAdapterInfo[]>([]);
+  const [adhoc, setAdhoc] = useState("");
+  const [adhocKind, setAdhocKind] = useState<"host" | "url">("host");
+  const [adapter, setAdapter] = useState("builtin");
+  const [showForm, setShowForm] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [findingScan, setFindingScan] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    api.scanTargets().then(setTargets).catch(() => setTargets([]));
+    api.scans(50).then(setScans).catch(() => setScans([]));
+  }, []);
+  useEffect(() => { load(); }, [load, reloadKey]);
+  useEffect(() => { api.scanConfig().then((c) => setAdapters(c.adapters)).catch(() => setAdapters([{ id: "builtin", name: "Built-in" }])); }, []);
+
+  async function runAdhoc() {
+    if (!adhoc.trim()) return;
+    setBusy(true); setMsg("");
+    try { const s = await api.runScan({ target: adhoc.trim(), kind: adhocKind, adapter }); setMsg(`Scan ${s.status}: ${s.findingCount} finding(s), ${s.openPorts} open port(s), ${s.cveCount} CVE.`); setAdhoc(""); load(); }
+    catch (e) { setMsg(`Scan failed: ${(e as Error).message}`); }
+    finally { setBusy(false); }
+  }
+  async function runTarget(t: ScanTarget) {
+    setBusy(true); setMsg("");
+    try { const s = await api.runScan({ targetId: t.id }); setMsg(`Scan ${t.name}: ${s.status} — ${s.findingCount} finding(s), ${s.cveCount} CVE.`); load(); }
+    catch (e) { setMsg(`Scan failed: ${(e as Error).message}`); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <section className="panel">
+      <div className="grid-toolbar">
+        <div className="toolbar-title"><Target size={16} /> Vulnerability scanning</div>
+        <span className="muted" style={{ fontSize: 12 }}>adapters: {adapters.map((a) => a.name).join(", ") || "builtin"}</span>
+        <div className="spacer" />
+        {canWrite && <button className="icon-btn" data-tooltip="Add saved target" aria-label="Add target" onClick={() => setShowForm((v) => !v)}><Plus size={18} /></button>}
+        <button className="icon-btn" data-tooltip="Refresh" aria-label="Refresh" onClick={load}><RefreshCw size={18} /></button>
+      </div>
+      {canWrite && (
+        <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border)" }}>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 6 }}>Run an ad-hoc scan (TCP ports + HTTP banner/headers; discovered products are correlated to tracked CVEs and registered as assets). Only scan systems you are authorized to test.</div>
+          <div className="ask-form" style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <input className="note-input" placeholder="host / IP / URL" value={adhoc} onChange={(e) => setAdhoc(e.target.value)} />
+            <select className="page-size" value={adhocKind} onChange={(e) => setAdhocKind(e.target.value as "host" | "url")}>
+              <option value="host">host</option><option value="url">url</option>
+            </select>
+            <select className="page-size" value={adapter} onChange={(e) => setAdapter(e.target.value)}>
+              {adapters.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+            </select>
+            <button className="btn-primary" disabled={busy} onClick={runAdhoc}><Play size={16} className={busy ? "spin" : ""} /> Scan now</button>
+          </div>
+          {msg && <div className="muted" style={{ marginTop: 8 }}>{msg}</div>}
+        </div>
+      )}
+      {showForm && canWrite && <ScanTargetForm adapters={adapters} onAdded={() => { setShowForm(false); load(); }} />}
+
+      <div className="grid-toolbar"><div className="toolbar-title">Saved targets <span className="muted">({targets.length})</span></div></div>
+      <div style={{ padding: "4px 16px" }}>
+        {targets.length === 0 && <div className="empty">No saved targets. Add one (with an optional cron) for scheduled scans, or run ad-hoc above.</div>}
+        {targets.map((t) => (
+          <div className="ov-row" key={t.id}>
+            {canWrite
+              ? <button className={`icon-btn ${t.enabled ? "fb-on" : ""}`} data-tooltip={t.enabled ? "Disable" : "Enable"} aria-label="Toggle" onClick={() => api.updateScanTarget(t.id, { enabled: !t.enabled }).then(load).catch(() => {})}><Power size={16} /></button>
+              : <span className="badge info">{t.enabled ? "on" : "off"}</span>}
+            <div className="ov-row-text">
+              <div className="ov-primary">{t.name} <span className="muted mono">· {t.target}</span></div>
+              <div className="ov-secondary muted">{t.kind} · {t.adapter}{t.schedule ? ` · ${t.schedule}` : " · manual"}{t.lastScanAt ? ` · last ${formatDate(t.lastScanAt)}` : ""}</div>
+            </div>
+            <div className="spacer" />
+            {canWrite && <button className="icon-btn" data-tooltip="Scan now" aria-label="Scan now" disabled={busy} onClick={() => runTarget(t)}><Play size={16} className={busy ? "spin" : ""} /></button>}
+            {canWrite && <button className="icon-btn danger" data-tooltip="Delete target" aria-label="Delete target" onClick={() => api.deleteScanTarget(t.id).then(load).catch(() => {})}><Trash2 size={16} /></button>}
+          </div>
+        ))}
+      </div>
+
+      <div className="grid-toolbar" style={{ marginTop: 6 }}><div className="toolbar-title">Recent scans <span className="muted">({scans.length})</span></div></div>
+      <div style={{ padding: "4px 16px 12px" }}>
+        {scans.length === 0 && <div className="empty">No scans yet.</div>}
+        {scans.map((s) => (
+          <div className="ov-row" key={s.id} style={{ cursor: "pointer" }} onClick={() => setFindingScan(s.id)}>
+            <span className={`badge ${scanStatusBadge(s.status)}`}>{s.status}</span>
+            <div className="ov-row-text">
+              <div className="ov-primary mono">{s.target}</div>
+              <div className="ov-secondary muted">{s.findingCount} finding(s) · {s.openPorts} open port(s) · {s.cveCount} CVE · {formatDate(s.finishedAt ?? s.createdAt)}{s.error ? ` · ${s.error}` : ""}</div>
+            </div>
+            <ChevronRight size={16} />
+          </div>
+        ))}
+      </div>
+      {findingScan && <ScanFindingsModal scanId={findingScan} onClose={() => setFindingScan(null)} />}
+    </section>
+  );
+}
+
+function ScanFindingsModal({ scanId, onClose }: { scanId: string; onClose: () => void }) {
+  const [data, setData] = useState<{ scan: Scan; findings: ScanFinding[] } | null>(null);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow; document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
+  useEffect(() => { api.scan(scanId).then(setData).catch(() => setData(null)); }, [scanId]);
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title"><Target size={16} /> Scan findings {data && <span className="muted">· {data.scan.target}</span>}</div>
+          <div className="spacer" />
+          <button className="icon-btn" data-tooltip="Close" aria-label="Close" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body" style={{ padding: 16 }}>
+          {!data && <div className="empty">Loading…</div>}
+          {data && data.findings.length === 0 && <div className="empty">No findings for this scan.</div>}
+          {data?.findings.map((f) => (
+            <div className="ov-row" key={f.id}>
+              <span className={`badge ${f.severity}`}>{f.severity}</span>
+              <div className="ov-row-text">
+                <div className="ov-primary">
+                  {f.title}
+                  {f.cve && <a style={{ marginLeft: 6 }} href={`https://nvd.nist.gov/vuln/detail/${f.cve}`} target="_blank" rel="noopener noreferrer">{f.cve}</a>}
+                </div>
+                <div className="ov-secondary muted">
+                  {[f.host, f.port ? `:${f.port}` : "", f.service].filter(Boolean).join(" ")}
+                  {f.product ? ` · ${f.product}${f.version ? " " + f.version : ""}` : ""}
+                </div>
+                <div className="ov-secondary">{f.description}</div>
+              </div>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );

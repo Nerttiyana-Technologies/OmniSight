@@ -4,8 +4,11 @@ import { dirname, join } from "node:path";
 import { EventEmitter } from "node:events";
 import pg from "pg";
 import {
-  computeRiskScore, buildDigest,
+  computeRiskScore, buildDigest, assetMatchesVuln, assetSearchTerms, normalizeObservable,
   type Source, type Vulnerability, type Indicator, type Advisory, type Digest, type User, type Role, type Breach,
+  type Asset, type NewAsset, type AssetMatchType, type Criticality,
+  type MonitorEvent, type ParsedObservable, type EventSeverity,
+  type ScanTarget, type NewScanTarget, type Scan, type ScanFinding, type RawScanFinding, type ScanStatus,
 } from "@omnisight/shared";
 
 export interface ListOptions {
@@ -37,6 +40,81 @@ export interface Stats {
   indicators: number;
   advisories: number;
   inStack: number;
+  assets: number;        // Phase 2: tracked assets
+  eventsMatched: number; // Phase 2: environment events that hit an indicator
+  findings: number;      // Phase 3: scan findings
+}
+
+// --- Phase 2: assets ---
+
+export interface AssetListOptions {
+  limit?: number;
+  offset?: number;
+  q?: string;
+  kind?: string;
+  criticality?: string;
+  origin?: string;
+}
+export interface AssetPage {
+  items: Asset[];
+  total: number;
+}
+
+/** A vulnerability matched to an asset in the inventory. */
+export interface AssetMatch {
+  assetId: string;
+  assetName: string;
+  criticality: Criticality;
+  cve: string;
+  title: string;
+  riskScore: number;
+  knownExploited: boolean;
+  matchType: AssetMatchType;
+  reason: string;
+}
+
+// --- Phase 2: environment events ---
+
+export interface EventListOptions {
+  limit?: number;
+  offset?: number;
+  matchedOnly?: boolean;
+  kind?: string;
+  q?: string;
+}
+export interface EventPage {
+  items: MonitorEvent[];
+  total: number;
+}
+export interface EventIngestResult {
+  inserted: number;
+  matched: number;
+}
+export interface EventStats {
+  total: number;
+  matched: number;
+  last24h: number;
+}
+
+// --- Phase 3: scans ---
+
+export interface FindingListOptions {
+  limit?: number;
+  offset?: number;
+  scanId?: string;
+  cve?: string;
+  severity?: string;
+  withCveOnly?: boolean;
+}
+export interface FindingPage {
+  items: ScanFinding[];
+  total: number;
+}
+export interface FindingStats {
+  total: number;
+  withCve: number;
+  critical: number;
+  high: number;
 }
 
 export interface IndicatorListOptions {
@@ -374,6 +452,44 @@ export interface Repository {
   signalChange(payload?: string): Promise<void>;
   /** Subscribe to change signals (Postgres LISTEN / in-memory event). */
   subscribeChanges(cb: (payload: string) => void): Promise<void>;
+
+  // --- Phase 2: asset inventory ---
+  listAssets(opts?: AssetListOptions): Promise<AssetPage>;
+  getAsset(id: string): Promise<Asset | null>;
+  createAsset(a: NewAsset): Promise<Asset>;
+  /** Bulk import/upsert (CSV / SBOM). De-duped on (vendor,product,version,cpe,name). */
+  upsertAssets(items: NewAsset[]): Promise<number>;
+  updateAsset(id: string, patch: Partial<NewAsset>): Promise<void>;
+  deleteAsset(id: string): Promise<void>;
+  countAssets(): Promise<number>;
+  /** Vulnerabilities matched to inventory assets (risk-ranked). */
+  assetMatches(limit?: number): Promise<AssetMatch[]>;
+  /** Distinct lower-cased match terms contributed by the asset inventory. */
+  assetTerms(): Promise<string[]>;
+  /** Effective "My Stack": watchlist terms ∪ asset terms (drives matching/alerts). */
+  stackTerms(): Promise<string[]>;
+
+  // --- Phase 2: environment events ---
+  ingestEvents(observables: ParsedObservable[]): Promise<EventIngestResult>;
+  listEvents(opts?: EventListOptions): Promise<EventPage>;
+  eventStats(): Promise<EventStats>;
+  /** Delete events older than `days`. Returns count removed. */
+  pruneEvents(days: number): Promise<number>;
+
+  // --- Phase 3: scan targets, scans, findings ---
+  listScanTargets(): Promise<ScanTarget[]>;
+  getScanTarget(id: string): Promise<ScanTarget | null>;
+  createScanTarget(t: NewScanTarget): Promise<ScanTarget>;
+  updateScanTarget(id: string, patch: Partial<NewScanTarget>): Promise<void>;
+  deleteScanTarget(id: string): Promise<void>;
+  setTargetScanned(id: string): Promise<void>;
+  createScan(s: Pick<Scan, "targetId" | "target" | "adapter" | "status">): Promise<Scan>;
+  updateScan(id: string, patch: Partial<Omit<Scan, "id" | "createdAt">>): Promise<void>;
+  getScan(id: string): Promise<Scan | null>;
+  listScans(limit?: number): Promise<Scan[]>;
+  insertFindings(scanId: string, findings: RawScanFinding[]): Promise<number>;
+  listFindings(opts?: FindingListOptions): Promise<FindingPage>;
+  findingStats(): Promise<FindingStats>;
 }
 
 /** Picks Postgres when DATABASE_URL is set, otherwise an in-memory store. */
@@ -387,7 +503,7 @@ export function createRepository(databaseUrl = process.env.DATABASE_URL): Reposi
 
 /** Gather the day's signals from any repository and build the brief. */
 export async function composeDigest(repo: Repository): Promise<Digest> {
-  const [stats, terms] = await Promise.all([repo.stats(), repo.listWatchlist()]);
+  const [stats, terms] = await Promise.all([repo.stats(), repo.stackTerms()]);
   const [topVulns, recentKev, topIocs] = await Promise.all([
     repo.page({ sort: "risk", dir: "desc", limit: 10 }).then((r) => r.items),
     repo.page({ source: "cisa-kev", sort: "reported", dir: "desc", limit: 10 }).then((r) => r.items),
@@ -404,6 +520,43 @@ export function matchesTerms(v: Vulnerability, terms: string[]): boolean {
   if (terms.length === 0) return false;
   const hay = `${v.vendor ?? ""} ${v.product ?? ""} ${v.title}`.toLowerCase();
   return terms.some((t) => hay.includes(t.toLowerCase()));
+}
+
+const CRIT_RANK: Record<Criticality, number> = { critical: 4, high: 3, medium: 2, low: 1 };
+
+/** Severity for a matched environment event, from the hit indicator. */
+function eventSeverity(i: { confidence: number | null; malware: string | null }): EventSeverity {
+  const c = i.confidence ?? 0;
+  if (c >= 75) return "high";
+  if (c >= 40 || i.malware) return "medium";
+  return "low";
+}
+
+/** Build a full Asset from a NewAsset (assign id + timestamps). */
+function mkAsset(a: NewAsset, id = newId(), createdAt?: string): Asset {
+  const now = new Date().toISOString();
+  return {
+    id,
+    name: a.name,
+    kind: a.kind,
+    vendor: a.vendor ?? null,
+    product: a.product ?? null,
+    version: a.version ?? null,
+    cpe: a.cpe ?? null,
+    ip: a.ip ?? null,
+    hostname: a.hostname ?? null,
+    owner: a.owner ?? null,
+    criticality: a.criticality,
+    tags: a.tags ?? [],
+    origin: a.origin,
+    createdAt: createdAt ?? now,
+    updatedAt: now,
+  };
+}
+
+/** Stable de-dupe key for asset imports. */
+function assetKey(a: Pick<Asset, "vendor" | "product" | "version" | "cpe" | "name">): string {
+  return [a.cpe, a.vendor, a.product, a.version, a.name].map((s) => (s ?? "").trim().toLowerCase()).join("|");
 }
 
 export class InMemoryRepository implements Repository {
@@ -448,7 +601,7 @@ export class InMemoryRepository implements Repository {
   private alertLog = new Set<string>();
 
   async pendingStackAlerts(minRisk = 75): Promise<Vulnerability[]> {
-    const terms = [...this.watch];
+    const terms = await this.stackTerms();
     if (terms.length === 0) return [];
     const out: Vulnerability[] = [];
     for (const v of this.vulns.values()) {
@@ -896,9 +1049,213 @@ export class InMemoryRepository implements Repository {
       .slice(0, limit);
   }
 
+  // --- Phase 2: asset inventory ---
+  private assets = new Map<string, Asset>();
+  async listAssets(opts: AssetListOptions = {}): Promise<AssetPage> {
+    let rows = [...this.assets.values()];
+    if (opts.kind) rows = rows.filter((a) => a.kind === opts.kind);
+    if (opts.criticality) rows = rows.filter((a) => a.criticality === opts.criticality);
+    if (opts.origin) rows = rows.filter((a) => a.origin === opts.origin);
+    if (opts.q) {
+      const q = opts.q.toLowerCase();
+      rows = rows.filter((a) => `${a.name} ${a.vendor ?? ""} ${a.product ?? ""} ${a.cpe ?? ""} ${a.hostname ?? ""} ${a.ip ?? ""} ${a.tags.join(" ")}`.toLowerCase().includes(q));
+    }
+    rows.sort((a, b) => CRIT_RANK[b.criticality] - CRIT_RANK[a.criticality] || a.name.localeCompare(b.name));
+    const offset = opts.offset ?? 0;
+    const limit = opts.limit ?? 50;
+    return { items: rows.slice(offset, offset + limit), total: rows.length };
+  }
+  async getAsset(id: string): Promise<Asset | null> {
+    return this.assets.get(id) ?? null;
+  }
+  async createAsset(a: NewAsset): Promise<Asset> {
+    const asset = mkAsset(a, a.id ?? newId());
+    this.assets.set(asset.id, asset);
+    return asset;
+  }
+  async upsertAssets(items: NewAsset[]): Promise<number> {
+    const byKey = new Map<string, Asset>();
+    for (const a of this.assets.values()) byKey.set(assetKey(a), a);
+    for (const item of items) {
+      const built = mkAsset(item);
+      const k = assetKey(built);
+      const existing = byKey.get(k);
+      const asset = existing ? { ...built, id: existing.id, createdAt: existing.createdAt } : built;
+      this.assets.set(asset.id, asset);
+      byKey.set(k, asset);
+    }
+    return items.length;
+  }
+  async updateAsset(id: string, patch: Partial<NewAsset>): Promise<void> {
+    const a = this.assets.get(id);
+    if (a) this.assets.set(id, { ...a, ...patch, id, updatedAt: new Date().toISOString() } as Asset);
+  }
+  async deleteAsset(id: string): Promise<void> {
+    this.assets.delete(id);
+  }
+  async countAssets(): Promise<number> {
+    return this.assets.size;
+  }
+  async assetMatches(limit = 200): Promise<AssetMatch[]> {
+    const out: AssetMatch[] = [];
+    const vulns = [...this.vulns.values()];
+    for (const a of this.assets.values()) {
+      for (const v of vulns) {
+        const r = assetMatchesVuln(a, v);
+        if (!r.match || !r.type) continue;
+        out.push({
+          assetId: a.id, assetName: a.name, criticality: a.criticality,
+          cve: v.cveId ?? v.id, title: v.title, riskScore: v.riskScore,
+          knownExploited: v.knownExploited, matchType: r.type, reason: r.reason,
+        });
+      }
+    }
+    out.sort((x, y) => CRIT_RANK[y.criticality] - CRIT_RANK[x.criticality] || y.riskScore - x.riskScore);
+    return out.slice(0, limit);
+  }
+  async assetTerms(): Promise<string[]> {
+    const set = new Set<string>();
+    for (const a of this.assets.values()) for (const t of assetSearchTerms(a)) set.add(t);
+    return [...set];
+  }
+  async stackTerms(): Promise<string[]> {
+    const set = new Set<string>(this.watch);
+    for (const t of await this.assetTerms()) set.add(t);
+    return [...set];
+  }
+
+  // --- Phase 2: environment events ---
+  private events: MonitorEvent[] = [];
+  private findIndicatorMatch(kind: string, value: string): Indicator | null {
+    for (const i of this.indicators.values()) {
+      if (i.type !== kind) continue;
+      if (normalizeObservable(kind as MonitorEvent["kind"], i.value) === value) return i;
+    }
+    return null;
+  }
+  async ingestEvents(observables: ParsedObservable[]): Promise<EventIngestResult> {
+    let matched = 0;
+    const now = new Date().toISOString();
+    for (const o of observables) {
+      const hit = this.findIndicatorMatch(o.kind, o.value);
+      if (hit) matched++;
+      this.events.unshift({
+        id: newId(), sensor: o.sensor, kind: o.kind, value: o.value, host: o.host,
+        observedAt: o.observedAt, raw: o.raw, matched: Boolean(hit),
+        matchedSource: hit?.source ?? null, malware: hit?.malware ?? null,
+        severity: hit ? eventSeverity(hit) : "info", createdAt: now,
+      });
+    }
+    if (this.events.length > 5000) this.events.length = 5000;
+    return { inserted: observables.length, matched };
+  }
+  async listEvents(opts: EventListOptions = {}): Promise<EventPage> {
+    let rows = this.events;
+    if (opts.matchedOnly) rows = rows.filter((e) => e.matched);
+    if (opts.kind) rows = rows.filter((e) => e.kind === opts.kind);
+    if (opts.q) {
+      const q = opts.q.toLowerCase();
+      rows = rows.filter((e) => `${e.value} ${e.sensor} ${e.host ?? ""} ${e.malware ?? ""}`.toLowerCase().includes(q));
+    }
+    const offset = opts.offset ?? 0;
+    const limit = opts.limit ?? 100;
+    return { items: rows.slice(offset, offset + limit), total: rows.length };
+  }
+  async eventStats(): Promise<EventStats> {
+    const cutoff = Date.now() - 86400000;
+    return {
+      total: this.events.length,
+      matched: this.events.filter((e) => e.matched).length,
+      last24h: this.events.filter((e) => new Date(e.createdAt).getTime() >= cutoff).length,
+    };
+  }
+  async pruneEvents(days: number): Promise<number> {
+    const cutoff = Date.now() - days * 86400000;
+    const before = this.events.length;
+    this.events = this.events.filter((e) => new Date(e.createdAt).getTime() >= cutoff);
+    return before - this.events.length;
+  }
+
+  // --- Phase 3: scans ---
+  private scanTargets = new Map<string, ScanTarget>();
+  private scans = new Map<string, Scan>();
+  private findings: ScanFinding[] = [];
+  async listScanTargets(): Promise<ScanTarget[]> {
+    return [...this.scanTargets.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+  async getScanTarget(id: string): Promise<ScanTarget | null> {
+    return this.scanTargets.get(id) ?? null;
+  }
+  async createScanTarget(t: NewScanTarget): Promise<ScanTarget> {
+    const target: ScanTarget = {
+      id: t.id ?? newId(), name: t.name, target: t.target, kind: t.kind,
+      adapter: t.adapter, enabled: t.enabled, schedule: t.schedule ?? null,
+      createdAt: new Date().toISOString(), lastScanAt: null,
+    };
+    this.scanTargets.set(target.id, target);
+    return target;
+  }
+  async updateScanTarget(id: string, patch: Partial<NewScanTarget>): Promise<void> {
+    const t = this.scanTargets.get(id);
+    if (t) this.scanTargets.set(id, { ...t, ...patch, id });
+  }
+  async deleteScanTarget(id: string): Promise<void> {
+    this.scanTargets.delete(id);
+  }
+  async setTargetScanned(id: string): Promise<void> {
+    const t = this.scanTargets.get(id);
+    if (t) t.lastScanAt = new Date().toISOString();
+  }
+  async createScan(s: Pick<Scan, "targetId" | "target" | "adapter" | "status">): Promise<Scan> {
+    const now = new Date().toISOString();
+    const scan: Scan = {
+      id: newId(), targetId: s.targetId, target: s.target, adapter: s.adapter, status: s.status,
+      startedAt: s.status === "running" ? now : null, finishedAt: null,
+      findingCount: 0, openPorts: 0, cveCount: 0, error: null, createdAt: now,
+    };
+    this.scans.set(scan.id, scan);
+    return scan;
+  }
+  async updateScan(id: string, patch: Partial<Omit<Scan, "id" | "createdAt">>): Promise<void> {
+    const s = this.scans.get(id);
+    if (s) this.scans.set(id, { ...s, ...patch });
+  }
+  async getScan(id: string): Promise<Scan | null> {
+    return this.scans.get(id) ?? null;
+  }
+  async listScans(limit = 100): Promise<Scan[]> {
+    return [...this.scans.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit);
+  }
+  async insertFindings(scanId: string, items: RawScanFinding[]): Promise<number> {
+    const now = new Date().toISOString();
+    for (const f of items) this.findings.unshift({ ...f, id: newId(), scanId, createdAt: now });
+    if (this.findings.length > 10000) this.findings.length = 10000;
+    return items.length;
+  }
+  async listFindings(opts: FindingListOptions = {}): Promise<FindingPage> {
+    let rows = this.findings;
+    if (opts.scanId) rows = rows.filter((f) => f.scanId === opts.scanId);
+    if (opts.cve) rows = rows.filter((f) => (f.cve ?? "").toUpperCase() === opts.cve!.toUpperCase());
+    if (opts.severity) rows = rows.filter((f) => f.severity === opts.severity);
+    if (opts.withCveOnly) rows = rows.filter((f) => Boolean(f.cve));
+    const rank: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
+    rows = [...rows].sort((a, b) => (rank[b.severity] ?? 0) - (rank[a.severity] ?? 0) || b.createdAt.localeCompare(a.createdAt));
+    const offset = opts.offset ?? 0;
+    const limit = opts.limit ?? 100;
+    return { items: rows.slice(offset, offset + limit), total: rows.length };
+  }
+  async findingStats(): Promise<FindingStats> {
+    return {
+      total: this.findings.length,
+      withCve: this.findings.filter((f) => f.cve).length,
+      critical: this.findings.filter((f) => f.severity === "critical").length,
+      high: this.findings.filter((f) => f.severity === "high").length,
+    };
+  }
+
   async stats(): Promise<Stats> {
     const rows = [...this.vulns.values()];
-    const terms = [...this.watch];
+    const terms = await this.stackTerms();
     return {
       total: rows.length,
       knownExploited: rows.filter((v) => v.knownExploited).length,
@@ -909,6 +1266,9 @@ export class InMemoryRepository implements Repository {
       indicators: this.indicators.size,
       advisories: this.advisories.size,
       inStack: terms.length ? rows.filter((v) => matchesTerms(v, terms)).length : 0,
+      assets: this.assets.size,
+      eventsMatched: this.events.filter((e) => e.matched).length,
+      findings: this.findings.length,
     };
   }
 }
@@ -1007,7 +1367,7 @@ export class PostgresRepository implements Repository {
   }
 
   async pendingStackAlerts(minRisk = 75): Promise<Vulnerability[]> {
-    const terms = await this.listWatchlist();
+    const terms = await this.stackTerms();
     if (terms.length === 0) return [];
     const params: unknown[] = [];
     const ors = terms.map((t) => {
@@ -1746,6 +2106,386 @@ export class PostgresRepository implements Repository {
     return rows.map(rowToVuln);
   }
 
+  // --- Phase 2: asset inventory ---
+  private rowToAsset(r: Record<string, unknown>): Asset {
+    return {
+      id: r.id as string,
+      name: r.name as string,
+      kind: r.kind as Asset["kind"],
+      vendor: (r.vendor as string) ?? null,
+      product: (r.product as string) ?? null,
+      version: (r.version as string) ?? null,
+      cpe: (r.cpe as string) ?? null,
+      ip: (r.ip as string) ?? null,
+      hostname: (r.hostname as string) ?? null,
+      owner: (r.owner as string) ?? null,
+      criticality: (r.criticality as Criticality) ?? "medium",
+      tags: (r.tags as string[]) ?? [],
+      origin: (r.origin as Asset["origin"]) ?? "manual",
+      createdAt: r.created_at ? new Date(r.created_at as string).toISOString() : null,
+      updatedAt: r.updated_at ? new Date(r.updated_at as string).toISOString() : null,
+    };
+  }
+  private static ASSET_ORDER = `ORDER BY CASE criticality WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END DESC, name`;
+  async listAssets(opts: AssetListOptions = {}): Promise<AssetPage> {
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (opts.kind) { params.push(opts.kind); where.push(`kind = $${params.length}`); }
+    if (opts.criticality) { params.push(opts.criticality); where.push(`criticality = $${params.length}`); }
+    if (opts.origin) { params.push(opts.origin); where.push(`origin = $${params.length}`); }
+    if (opts.q) {
+      params.push(`%${opts.q}%`);
+      const p = `$${params.length}`;
+      where.push(`(name ILIKE ${p} OR vendor ILIKE ${p} OR product ILIKE ${p} OR cpe ILIKE ${p} OR hostname ILIKE ${p} OR ip ILIKE ${p})`);
+    }
+    const clause = where.length ? "WHERE " + where.join(" AND ") : "";
+    const countRes = await this.pool.query(`SELECT COUNT(*)::int AS total FROM assets ${clause}`, params);
+    const paged = [...params];
+    paged.push(opts.limit ?? 50); const li = `$${paged.length}`;
+    paged.push(opts.offset ?? 0); const oi = `$${paged.length}`;
+    const { rows } = await this.pool.query(`SELECT * FROM assets ${clause} ${PostgresRepository.ASSET_ORDER} LIMIT ${li} OFFSET ${oi}`, paged);
+    return { items: rows.map((r) => this.rowToAsset(r)), total: countRes.rows[0].total as number };
+  }
+  async getAsset(id: string): Promise<Asset | null> {
+    const { rows } = await this.pool.query(`SELECT * FROM assets WHERE id = $1`, [id]);
+    return rows[0] ? this.rowToAsset(rows[0]) : null;
+  }
+  private async insertAsset(client: pg.PoolClient | pg.Pool, a: NewAsset, id: string): Promise<Asset> {
+    const { rows } = await client.query(
+      `INSERT INTO assets (id,name,kind,vendor,product,version,cpe,ip,hostname,owner,criticality,tags,origin)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+      [id, a.name, a.kind, a.vendor ?? null, a.product ?? null, a.version ?? null, a.cpe ?? null,
+       a.ip ?? null, a.hostname ?? null, a.owner ?? null, a.criticality, JSON.stringify(a.tags ?? []), a.origin],
+    );
+    return this.rowToAsset(rows[0]);
+  }
+  async createAsset(a: NewAsset): Promise<Asset> {
+    return this.insertAsset(this.pool, a, a.id ?? newId());
+  }
+  async upsertAssets(items: NewAsset[]): Promise<number> {
+    if (items.length === 0) return 0;
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (const a of items) {
+        const { rows } = await client.query(
+          `SELECT id FROM assets WHERE lower(coalesce(name,'')) = lower($1)
+             AND lower(coalesce(vendor,'')) = lower($2) AND lower(coalesce(product,'')) = lower($3)
+             AND lower(coalesce(version,'')) = lower($4) AND lower(coalesce(cpe,'')) = lower($5) LIMIT 1`,
+          [a.name, a.vendor ?? "", a.product ?? "", a.version ?? "", a.cpe ?? ""],
+        );
+        if (rows[0]) {
+          await client.query(
+            `UPDATE assets SET kind=$2, ip=$3, hostname=$4, owner=$5, criticality=$6, tags=$7, origin=$8, updated_at=now() WHERE id=$1`,
+            [rows[0].id, a.kind, a.ip ?? null, a.hostname ?? null, a.owner ?? null, a.criticality, JSON.stringify(a.tags ?? []), a.origin],
+          );
+        } else {
+          await this.insertAsset(client, a, a.id ?? newId());
+        }
+      }
+      await client.query("COMMIT");
+      return items.length;
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+  async updateAsset(id: string, patch: Partial<NewAsset>): Promise<void> {
+    const sets: string[] = []; const params: unknown[] = [];
+    const col: Record<string, string> = {
+      name: "name", kind: "kind", vendor: "vendor", product: "product", version: "version",
+      cpe: "cpe", ip: "ip", hostname: "hostname", owner: "owner", criticality: "criticality", tags: "tags", origin: "origin",
+    };
+    for (const [k, v] of Object.entries(patch)) {
+      const c = col[k]; if (!c) continue;
+      params.push(k === "tags" ? JSON.stringify(v) : v);
+      sets.push(`${c} = $${params.length}`);
+    }
+    if (!sets.length) return;
+    sets.push(`updated_at = now()`);
+    params.push(id);
+    await this.pool.query(`UPDATE assets SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+  }
+  async deleteAsset(id: string): Promise<void> {
+    await this.pool.query(`DELETE FROM assets WHERE id = $1`, [id]);
+  }
+  async countAssets(): Promise<number> {
+    const { rows } = await this.pool.query(`SELECT COUNT(*)::int AS n FROM assets`);
+    return rows[0].n as number;
+  }
+  async assetMatches(limit = 200): Promise<AssetMatch[]> {
+    const { rows: assetRows } = await this.pool.query(`SELECT * FROM assets`);
+    const assets = assetRows.map((r) => this.rowToAsset(r));
+    const out: AssetMatch[] = [];
+    for (const a of assets) {
+      const terms = assetSearchTerms(a);
+      if (terms.length === 0) continue;
+      const params: unknown[] = [];
+      const ors = terms.map((t) => { params.push(`%${t}%`); const p = `$${params.length}`; return `(vendor ILIKE ${p} OR product ILIKE ${p} OR title ILIKE ${p})`; });
+      const { rows } = await this.pool.query(
+        `SELECT * FROM vulnerabilities WHERE ${ors.join(" OR ")} ORDER BY risk_score DESC LIMIT 60`,
+        params,
+      );
+      for (const v of rows.map(rowToVuln)) {
+        const r = assetMatchesVuln(a, v);
+        if (!r.match || !r.type) continue;
+        out.push({
+          assetId: a.id, assetName: a.name, criticality: a.criticality,
+          cve: v.cveId ?? v.id, title: v.title, riskScore: v.riskScore,
+          knownExploited: v.knownExploited, matchType: r.type, reason: r.reason,
+        });
+      }
+    }
+    out.sort((x, y) => CRIT_RANK[y.criticality] - CRIT_RANK[x.criticality] || y.riskScore - x.riskScore);
+    return out.slice(0, limit);
+  }
+  async assetTerms(): Promise<string[]> {
+    const { rows } = await this.pool.query(`SELECT name, vendor, product, cpe FROM assets`);
+    const set = new Set<string>();
+    for (const r of rows) for (const t of assetSearchTerms(this.rowToAsset(r))) set.add(t);
+    return [...set];
+  }
+  async stackTerms(): Promise<string[]> {
+    const [watch, assets] = await Promise.all([this.listWatchlist(), this.assetTerms()]);
+    return [...new Set([...watch, ...assets])];
+  }
+
+  // --- Phase 2: environment events ---
+  private rowToEvent(r: Record<string, unknown>): MonitorEvent {
+    return {
+      id: r.id as string,
+      sensor: (r.sensor as string) ?? "push",
+      kind: r.kind as MonitorEvent["kind"],
+      value: r.value as string,
+      host: (r.host as string) ?? null,
+      observedAt: r.observed_at ? new Date(r.observed_at as string).toISOString() : null,
+      raw: (r.raw as string) ?? null,
+      matched: Boolean(r.matched),
+      matchedSource: (r.matched_source as string) ?? null,
+      malware: (r.malware as string) ?? null,
+      severity: (r.severity as EventSeverity) ?? "info",
+      createdAt: new Date(r.created_at as string).toISOString(),
+    };
+  }
+  async ingestEvents(observables: ParsedObservable[]): Promise<EventIngestResult> {
+    if (observables.length === 0) return { inserted: 0, matched: 0 };
+    const capped = observables.slice(0, 2000);
+    const client = await this.pool.connect();
+    let matched = 0;
+    try {
+      await client.query("BEGIN");
+      for (const o of capped) {
+        const val = o.value.toLowerCase();
+        const { rows } = await client.query(
+          `SELECT source, malware, confidence FROM indicators
+             WHERE type = $1 AND (lower(value) = $2 OR lower(value) LIKE $2 || ':%') LIMIT 1`,
+          [o.kind, val],
+        );
+        const hit = rows[0];
+        const sev: EventSeverity = hit ? eventSeverity({ confidence: hit.confidence ?? null, malware: hit.malware ?? null }) : "info";
+        if (hit) matched++;
+        await client.query(
+          `INSERT INTO monitor_events (id,sensor,kind,value,host,observed_at,raw,matched,matched_source,malware,severity)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+          [newId(), o.sensor, o.kind, o.value, o.host, o.observedAt, o.raw, Boolean(hit), hit?.source ?? null, hit?.malware ?? null, sev],
+        );
+      }
+      await client.query("COMMIT");
+      return { inserted: capped.length, matched };
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+  async listEvents(opts: EventListOptions = {}): Promise<EventPage> {
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (opts.matchedOnly) where.push(`matched = TRUE`);
+    if (opts.kind) { params.push(opts.kind); where.push(`kind = $${params.length}`); }
+    if (opts.q) {
+      params.push(`%${opts.q}%`);
+      const p = `$${params.length}`;
+      where.push(`(value ILIKE ${p} OR sensor ILIKE ${p} OR host ILIKE ${p} OR malware ILIKE ${p})`);
+    }
+    const clause = where.length ? "WHERE " + where.join(" AND ") : "";
+    const countRes = await this.pool.query(`SELECT COUNT(*)::int AS total FROM monitor_events ${clause}`, params);
+    const paged = [...params];
+    paged.push(opts.limit ?? 100); const li = `$${paged.length}`;
+    paged.push(opts.offset ?? 0); const oi = `$${paged.length}`;
+    const { rows } = await this.pool.query(`SELECT * FROM monitor_events ${clause} ORDER BY created_at DESC LIMIT ${li} OFFSET ${oi}`, paged);
+    return { items: rows.map((r) => this.rowToEvent(r)), total: countRes.rows[0].total as number };
+  }
+  async eventStats(): Promise<EventStats> {
+    const { rows } = await this.pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE matched)::int AS matched,
+              COUNT(*) FILTER (WHERE created_at >= now() - interval '24 hours')::int AS last24h
+         FROM monitor_events`,
+    );
+    return { total: rows[0].total, matched: rows[0].matched, last24h: rows[0].last24h };
+  }
+  async pruneEvents(days: number): Promise<number> {
+    const res = await this.pool.query(`DELETE FROM monitor_events WHERE created_at < now() - ($1 || ' days')::interval`, [days]);
+    return res.rowCount ?? 0;
+  }
+
+  // --- Phase 3: scans ---
+  private rowToScanTarget(r: Record<string, unknown>): ScanTarget {
+    return {
+      id: r.id as string,
+      name: r.name as string,
+      target: r.target as string,
+      kind: r.kind as ScanTarget["kind"],
+      adapter: (r.adapter as string) ?? "builtin",
+      enabled: Boolean(r.enabled),
+      schedule: (r.schedule as string) ?? null,
+      createdAt: r.created_at ? new Date(r.created_at as string).toISOString() : null,
+      lastScanAt: r.last_scan_at ? new Date(r.last_scan_at as string).toISOString() : null,
+    };
+  }
+  private rowToScan(r: Record<string, unknown>): Scan {
+    return {
+      id: r.id as string,
+      targetId: (r.target_id as string) ?? null,
+      target: r.target as string,
+      adapter: (r.adapter as string) ?? "builtin",
+      status: r.status as ScanStatus,
+      startedAt: r.started_at ? new Date(r.started_at as string).toISOString() : null,
+      finishedAt: r.finished_at ? new Date(r.finished_at as string).toISOString() : null,
+      findingCount: Number(r.finding_count ?? 0),
+      openPorts: Number(r.open_ports ?? 0),
+      cveCount: Number(r.cve_count ?? 0),
+      error: (r.error as string) ?? null,
+      createdAt: new Date(r.created_at as string).toISOString(),
+    };
+  }
+  private rowToFinding(r: Record<string, unknown>): ScanFinding {
+    return {
+      id: r.id as string,
+      scanId: r.scan_id as string,
+      target: r.target as string,
+      host: (r.host as string) ?? null,
+      port: r.port != null ? Number(r.port) : null,
+      service: (r.service as string) ?? null,
+      product: (r.product as string) ?? null,
+      version: (r.version as string) ?? null,
+      cpe: (r.cpe as string) ?? null,
+      cve: (r.cve as string) ?? null,
+      severity: r.severity as ScanFinding["severity"],
+      title: r.title as string,
+      description: (r.description as string) ?? "",
+      evidence: (r.evidence as string) ?? null,
+      createdAt: new Date(r.created_at as string).toISOString(),
+    };
+  }
+  async listScanTargets(): Promise<ScanTarget[]> {
+    const { rows } = await this.pool.query(`SELECT * FROM scan_targets ORDER BY name`);
+    return rows.map((r) => this.rowToScanTarget(r));
+  }
+  async getScanTarget(id: string): Promise<ScanTarget | null> {
+    const { rows } = await this.pool.query(`SELECT * FROM scan_targets WHERE id = $1`, [id]);
+    return rows[0] ? this.rowToScanTarget(rows[0]) : null;
+  }
+  async createScanTarget(t: NewScanTarget): Promise<ScanTarget> {
+    const { rows } = await this.pool.query(
+      `INSERT INTO scan_targets (id,name,target,kind,adapter,enabled,schedule) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [t.id ?? newId(), t.name, t.target, t.kind, t.adapter, t.enabled, t.schedule ?? null],
+    );
+    return this.rowToScanTarget(rows[0]);
+  }
+  async updateScanTarget(id: string, patch: Partial<NewScanTarget>): Promise<void> {
+    const sets: string[] = []; const params: unknown[] = [];
+    const col: Record<string, string> = { name: "name", target: "target", kind: "kind", adapter: "adapter", enabled: "enabled", schedule: "schedule" };
+    for (const [k, v] of Object.entries(patch)) { const c = col[k]; if (!c) continue; params.push(v); sets.push(`${c} = $${params.length}`); }
+    if (!sets.length) return;
+    params.push(id);
+    await this.pool.query(`UPDATE scan_targets SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+  }
+  async deleteScanTarget(id: string): Promise<void> {
+    await this.pool.query(`DELETE FROM scan_targets WHERE id = $1`, [id]);
+  }
+  async setTargetScanned(id: string): Promise<void> {
+    await this.pool.query(`UPDATE scan_targets SET last_scan_at = now() WHERE id = $1`, [id]);
+  }
+  async createScan(s: Pick<Scan, "targetId" | "target" | "adapter" | "status">): Promise<Scan> {
+    const { rows } = await this.pool.query(
+      `INSERT INTO scans (id,target_id,target,adapter,status,started_at)
+         VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [newId(), s.targetId, s.target, s.adapter, s.status, s.status === "running" ? new Date().toISOString() : null],
+    );
+    return this.rowToScan(rows[0]);
+  }
+  async updateScan(id: string, patch: Partial<Omit<Scan, "id" | "createdAt">>): Promise<void> {
+    const sets: string[] = []; const params: unknown[] = [];
+    const col: Record<string, string> = {
+      status: "status", startedAt: "started_at", finishedAt: "finished_at",
+      findingCount: "finding_count", openPorts: "open_ports", cveCount: "cve_count", error: "error", target: "target", adapter: "adapter",
+    };
+    for (const [k, v] of Object.entries(patch)) { const c = col[k]; if (!c) continue; params.push(v); sets.push(`${c} = $${params.length}`); }
+    if (!sets.length) return;
+    params.push(id);
+    await this.pool.query(`UPDATE scans SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+  }
+  async getScan(id: string): Promise<Scan | null> {
+    const { rows } = await this.pool.query(`SELECT * FROM scans WHERE id = $1`, [id]);
+    return rows[0] ? this.rowToScan(rows[0]) : null;
+  }
+  async listScans(limit = 100): Promise<Scan[]> {
+    const { rows } = await this.pool.query(`SELECT * FROM scans ORDER BY created_at DESC LIMIT $1`, [Math.min(limit, 500)]);
+    return rows.map((r) => this.rowToScan(r));
+  }
+  async insertFindings(scanId: string, items: RawScanFinding[]): Promise<number> {
+    if (items.length === 0) return 0;
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (const f of items) {
+        await client.query(
+          `INSERT INTO scan_findings (id,scan_id,target,host,port,service,product,version,cpe,cve,severity,title,description,evidence)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+          [newId(), scanId, f.target, f.host, f.port, f.service, f.product, f.version, f.cpe, f.cve, f.severity, f.title, f.description, f.evidence],
+        );
+      }
+      await client.query("COMMIT");
+      return items.length;
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+  async listFindings(opts: FindingListOptions = {}): Promise<FindingPage> {
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (opts.scanId) { params.push(opts.scanId); where.push(`scan_id = $${params.length}`); }
+    if (opts.cve) { params.push(opts.cve.toUpperCase()); where.push(`upper(cve) = $${params.length}`); }
+    if (opts.severity) { params.push(opts.severity); where.push(`severity = $${params.length}`); }
+    if (opts.withCveOnly) where.push(`cve IS NOT NULL`);
+    const clause = where.length ? "WHERE " + where.join(" AND ") : "";
+    const countRes = await this.pool.query(`SELECT COUNT(*)::int AS total FROM scan_findings ${clause}`, params);
+    const paged = [...params];
+    paged.push(opts.limit ?? 100); const li = `$${paged.length}`;
+    paged.push(opts.offset ?? 0); const oi = `$${paged.length}`;
+    const order = `ORDER BY CASE severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, created_at DESC`;
+    const { rows } = await this.pool.query(`SELECT * FROM scan_findings ${clause} ${order} LIMIT ${li} OFFSET ${oi}`, paged);
+    return { items: rows.map((r) => this.rowToFinding(r)), total: countRes.rows[0].total as number };
+  }
+  async findingStats(): Promise<FindingStats> {
+    const { rows } = await this.pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE cve IS NOT NULL)::int AS with_cve,
+              COUNT(*) FILTER (WHERE severity = 'critical')::int AS critical,
+              COUNT(*) FILTER (WHERE severity = 'high')::int AS high
+         FROM scan_findings`,
+    );
+    return { total: rows[0].total, withCve: rows[0].with_cve, critical: rows[0].critical, high: rows[0].high };
+  }
+
   async stats(): Promise<Stats> {
     const { rows } = await this.pool.query(
       `SELECT COUNT(*)::int AS total,
@@ -1755,13 +2495,16 @@ export class PostgresRepository implements Repository {
               COUNT(*) FILTER (WHERE risk_score >= 50 AND risk_score < 75)::int AS high,
               (SELECT COUNT(*)::int FROM sources) AS sources,
               (SELECT COUNT(*)::int FROM indicators) AS indicators,
-              (SELECT COUNT(*)::int FROM advisories) AS advisories
+              (SELECT COUNT(*)::int FROM advisories) AS advisories,
+              (SELECT COUNT(*)::int FROM assets) AS assets,
+              (SELECT COUNT(*)::int FROM monitor_events WHERE matched) AS events_matched,
+              (SELECT COUNT(*)::int FROM scan_findings) AS findings
        FROM vulnerabilities`,
     );
     const r = rows[0];
 
-    // "In stack" depends on the watchlist terms, so count it separately.
-    const terms = await this.listWatchlist();
+    // "In stack" depends on the effective stack terms, so count it separately.
+    const terms = await this.stackTerms();
     let inStack = 0;
     if (terms.length) {
       const params: unknown[] = [];
@@ -1787,6 +2530,9 @@ export class PostgresRepository implements Repository {
       indicators: r.indicators,
       advisories: r.advisories,
       inStack,
+      assets: r.assets,
+      eventsMatched: r.events_matched,
+      findings: r.findings,
     };
   }
 }

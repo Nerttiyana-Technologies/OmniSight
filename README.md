@@ -1,191 +1,131 @@
-# OmniSight
+<p align="center">
+  <img src="assets/header.png" alt="OmniSight — real-time cyber situational awareness" width="100%">
+</p>
 
-**Open-source real-time cyber situational-awareness platform.** OmniSight fuses
-vulnerability, exploitation, and threat-actor signals into one correlated,
-glanceable dashboard — self-hostable in minutes, no heavyweight search cluster
-required.
+<p align="center">
+  <b>Open-source, real-time cyber situational-awareness platform.</b><br>
+  Fuse vulnerability, exploitation, indicator, and threat-actor signals into one correlated, glanceable dashboard —
+  match them against <i>your</i> environment, and actively scan it — self-hostable in minutes.
+</p>
 
-> Think "WorldMonitor for cyber": fast, opinionated, and easy to run — the
-> lightweight alternative to OpenCTI/MISP for teams who want to *see what's on
-> fire right now*, then drill in.
-
-Licensed under **Apache-2.0**.
+<p align="center">
+  <a href="#license"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-9a7b15"></a>
+  <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-end--to--end-3178c6">
+  <img alt="Node" src="https://img.shields.io/badge/Node-%E2%89%A520-3c873a">
+  <img alt="Deploy" src="https://img.shields.io/badge/deploy-docker--compose-2496ed">
+  <img alt="Status" src="https://img.shields.io/badge/phases%201%E2%80%933-shipped-2f7d57">
+</p>
 
 ---
 
-## Status
+OmniSight is the lightweight, opinionated alternative to heavyweight platforms like OpenCTI/MISP for teams who want to
+**see what's on fire right now**, then drill in — without the deployment tax. It runs with **zero API keys** on public
+feeds (optional keys unlock premium sources), starts with a single `docker compose up`, and is permissively licensed
+(Apache-2.0) for maximum adoption and contribution.
 
-Phase 0 scaffold — a working vertical slice. Two built-in connectors —
-**CISA KEV** (known-exploited vulns) and **NVD Recent CVEs** — ingest live data,
-which is enriched with **EPSS** (exploit probability) and **NVD CVSS**, scored,
-and streamed to an executive dashboard (dark/light) that updates in real time.
-The grid supports server-side filtering, sorting, and pagination over the full
-dataset.
+> Think *"WorldMonitor for cyber"*: fast, glanceable, correlation-first — and now extended from a threat-intel feed
+> into a full **detect → match → scan** loop across all three roadmap phases.
 
-The same CVE can appear from multiple sources (e.g. a CVE in both KEV and NVD);
-records are keyed on `(source, id)` so each is preserved, and enrichment applies
-to all of them — the seed of cross-source correlation.
+## Table of contents
 
-Beyond vulnerabilities, OmniSight also ingests **indicators of compromise** via
-the **abuse.ch ThreatFox**, **AlienVault OTX**, and **Pulsedive** connectors (IPs,
-domains, URLs, hashes with malware context — need `ABUSECH_AUTH_KEY` /
-`OTX_API_KEY` / `PULSEDIVE_API_KEY`). Pulsedive uses its **free REST Explore API**
-(a free key works; the paid TAXII server isn't required). The
-dashboard has a **Vulnerabilities** and an **Indicators** tab, each with its own
-filter/sort/paginate grid.
+- [Why OmniSight](#why-omnisight)
+- [Feature tour](#feature-tour)
+  - [Phase 1 — Threat-intel dashboard](#phase-1--threat-intel-dashboard)
+  - [Phase 2 — Defensive monitoring](#phase-2--defensive-monitoring)
+  - [Phase 3 — Vulnerability scanning](#phase-3--vulnerability-scanning)
+- [Quick start](#quick-start)
+- [Architecture](#architecture)
+- [Configuration](#configuration)
+- [Data sources](#data-sources)
+- [Adding feeds at runtime](#adding-feeds-at-runtime)
+- [API overview](#api-overview)
+- [Exports & interop](#exports--interop)
+- [Authentication & roles](#authentication--roles)
+- [Deployment](#deployment)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [Security & responsible use](#security--responsible-use)
+- [License](#license)
 
-### My Stack
+## Why OmniSight
 
-Declare the vendors and products you run (the **My Stack** panel). CVEs whose
-vendor, product, or title match are flagged in the grid, filterable with
-"My Stack only", and counted in a dedicated stat card — turning the global feed
-into "what affects *us*". Matching is server-side, so it scales and paginates.
+The open-source threat-intel space splits into two camps with a gap in the middle: **heavy enterprise platforms**
+(OpenCTI, MISP, TheHive) that are powerful but steep to deploy and run, and **lightweight feed tools** that are easy but
+narrow. OmniSight targets the gap — a modern, permissively-licensed, TypeScript platform that does WorldMonitor's
+situational-awareness job for cyber:
 
-### News & AI threats
+- **Correlation-first, not just aggregation.** The differentiator is meaningful cross-stream correlation and a composite
+  "what to worry about now" risk score — CVE ↔ KEV ↔ EPSS ↔ CVSS ↔ ATT&CK ↔ IOCs ↔ scan findings — not yet another feed reader.
+- **Glanceable executive UX.** A real-time dashboard with an executive-grade theme, full dark/light support, and
+  icon-based action buttons with tooltips throughout.
+- **Trivial to run.** PostgreSQL + Redis only; no ElasticSearch/RabbitMQ/MinIO. A zero-dependency in-memory demo mode
+  needs no database at all.
+- **Yours to extend.** A tiny connector SDK and a pluggable scan-adapter contract; new RSS/JSON/TAXII feeds can be added
+  from the dashboard at runtime — no code, no redeploy.
 
-A **News** tab ingests security news and advisories via an RSS connector
-(**The Hacker News**, **Dark Reading**, **SecurityWeek — AI**) plus **MITRE
-ATLAS** (the authoritative adversarial-ML knowledge base, via its STIX 2.1
-bundle). Items render as cards with source, date, and summary, filterable by
-source and search. New RSS feeds can be added at runtime as `kind: "rss"`
-sources — no code required.
+## Feature tour
 
-### Auth & roles (opt-in)
+### Phase 1 — Threat-intel dashboard
 
-Off by default (open). Set `AUTH_ENABLED=true` + `JWT_SECRET` and seed an admin
-(`ADMIN_USER`/`ADMIN_PASS`) to require login. Three roles — **viewer** (read-only),
-**analyst** (notes, watchlist, enrich, import), **admin** (+ manage sources &
-users). Local username/password (scrypt-hashed) with JWTs; RBAC enforced
-server-side and reflected in the UI. **SSO** is supported via a generic OIDC
-authorization-code flow — set the `OIDC_*` vars to show a "Sign in with SSO"
-button; first-time users are auto-provisioned as viewers. An **audit log**
-(admin-only) records mutating actions and logins for compliance review.
+**Ingestion & normalization.** A pluggable connector model — each connector is a small TypeScript module on a cron.
+Built-in connectors cover **CISA KEV** (known-exploited), **NVD** (recent CVEs), **abuse.ch ThreatFox**, **AlienVault OTX**,
+and **Pulsedive** (free REST Explore API) for indicators; **MITRE ATLAS** (STIX 2.1) and RSS for news/advisories. Everything
+normalizes to one shared domain model (vulnerabilities, indicators, advisories, actors, sources).
 
-### AI layer (optional, local-first)
+**Enrichment.** **EPSS** exploit-probability (keyless, bulk, every 30 min and on-demand), **NVD CVSS** (rate-limited, raised
+10× with `NVD_API_KEY`), and **IP geolocation** (keyless ipwho.is) feed a composite **risk score** (active exploitation
+dominates, then ransomware association, then CVSS/EPSS).
 
-Point OmniSight at any OpenAI-compatible endpoint — including a **local Ollama**
-(`LLM_BASE_URL=http://localhost:11434/v1`, no key, nothing leaves your machine).
-Two features light up when configured: a **Summarize** button on any CVE that
-turns the raw advisory into a 2–3 sentence SOC-ready brief, and an **Ask AI**
-box that translates a natural-language question ("exploited Cisco bugs, highest
-risk first") into structured filters and runs them against the live data. The
-model only ever produces *filters*; OmniSight executes the query, so results are
-grounded in real records. Everything degrades gracefully when no LLM is set.
+**Dashboard.** An **Overview** command center leads with a DEFCON-style threat-level header derived from current signal
+volume, plus the **Daily Brief** (top risks, new KEV, what's hitting your stack, top indicators) rendered as Markdown and
+as an executive **HTML email** the worker composes each morning. **Vulnerabilities** and **Indicators** tabs each have a
+server-side filter/sort/paginate grid; a **News** tab renders advisory cards; a **Map** tab plots geolocated attack
+origins; an **Actors** tab aggregates indicators into malware-family/campaign profiles.
 
-### Actor & campaign profiles
+**Correlation.** The same CVE from multiple sources is keyed on `(source, id)` and merged in an **Entity-resolution** view
+with per-source reliability. **CVE ↔ IOC correlation** links CVE references found in indicator context to tracked
+vulnerabilities; an optional **AI correlation** view (any OpenAI-compatible endpoint, including local Ollama) proposes
+relationships with confidence + rationale. ATT&CK/ATLAS techniques referenced across intel are ranked and shown in a
+**tactic × technique coverage matrix**, with **detection-gap analysis** flagging techniques no enabled rule covers.
 
-An **Actors** tab aggregates indicators by malware family / campaign into
-profiles: IOC counts by type, contributing sources, first/last activity, and the
-related CVEs and ATT&CK/ATLAS techniques extracted from their intel — with
-sample IOCs you can pivot into enrichment. Assembled entirely from ingested
-feeds, so it grows as you connect more sources.
+**Analyst workflow.** One-click **IOC enrichment & pivoting** (Shodan InternetDB + GreyNoise/AbuseIPDB/Pulsedive when
+keyed), an **IOC extractor** (paste text → refanged, grouped observables), **investigation notes** with TLP marking,
+**confirmed / false-positive feedback**, **saved searches**, an **RFI tracker**, **SBOM scanning** (CycloneDX/SPDX → OSV),
+**source-reliability weighting**, and **IOC aging/decay**.
 
-### SOAR-lite ticketing & automation rules
+**Alerting & automation (SOAR-lite).** Watchlist alerts to webhook/email; user-defined **automation rules**
+(trigger: min-risk / exploited-only / stack-only → action: webhook / email / Jira); per-stack-vuln **Jira** ticketing.
 
-Beyond webhook and email alerts, the worker can **open a Jira issue per
-stack-affecting vulnerability** (`JIRA_*` vars, Jira Cloud REST v2) — turning
-"a KEV just hit my stack" into an actionable, de-duplicated ticket automatically.
-For finer control, admins define **automation rules** in the dashboard: each rule
-is a trigger (risk threshold, exploited-only, My-Stack-only) plus an action
-(webhook / email / Jira). When any rule exists it replaces the env defaults, so
-you can route, say, "exploited + my-stack → Jira" and "critical anywhere → Slack"
-independently.
+**Real-time.** The dashboard subscribes to Server-Sent Events; in Postgres mode the worker signals the API via
+`LISTEN/NOTIFY` so a separate worker process still pushes live updates, with a 15s polling fallback.
 
-### TAXII 2.1 polling
+### Phase 2 — Defensive monitoring
 
-Add a **TAXII** feed from the dashboard (or `POST /api/sources` with
-`kind: "taxii"`): OmniSight polls the collection's objects endpoint on a schedule,
-parses the STIX 2.1 bundle, and ingests the indicators — complementing the
-existing STIX file import with live, scheduled pulls from OpenCTI / MISP / ISAC /
-government TAXII servers. Bearer-token or basic auth, per feed.
+Match the global feed against **your** environment.
 
-### Breach exposure (Have I Been Pwned)
+- **Structured asset inventory** (`Assets` tab) — vendor, product, version, **CPE**, IP/hostname, owner, criticality,
+  tags. Populate it by manual entry, **CSV import**, **SBOM import** (CycloneDX/SPDX components become tracked assets), or
+  **scan discovery** (Phase 3 registers what it finds).
+- **Intelligent CVE → asset matching** — incoming CVEs are matched to assets by **CPE** (strongest), then vendor+product,
+  then term, risk-ranked with the matching reason shown ("Vulnerabilities affecting your assets").
+- **My Stack, evolved.** "My Stack" is now the lightweight view over the inventory: asset-derived terms are unioned with
+  the watchlist to drive stack matching, alert rules, the `inStack` stat, and the daily brief.
+- **Environment-event monitoring** (`Monitoring` tab) — observables seen in your own logs/sensors are matched against
+  tracked indicators via three paths: a **JSON push API** (`POST /api/events`), **file/NDJSON/text upload**, and an
+  opt-in **syslog listener** (UDP + TCP) in the worker. Matched events carry severity, source, and malware context.
 
-An **Exposure** tab monitors the domains you list in `HIBP_DOMAINS` for known
-breaches via Have I Been Pwned — which breaches hit your brands, when, how many
-accounts, and what data classes leaked. It pulls HIBP's **free public breaches
-collection** (no API key, no subscription) and filters it to your domains
-locally, rather than the paid domain-search API; the worker refreshes daily.
-`HIBP_API_KEY` is optional and only raises rate limits.
+### Phase 3 — Vulnerability scanning
 
-### Map
+Actively assess hosts/URLs you own and feed the results back into correlation (`Scanning` tab).
 
-A **Map** tab plots geolocated attack origins on a world projection. IP
-indicators are geolocated (keyless ipwho.is) during the worker's enrichment
-cycle; the map aggregates them by country with a Top Origins panel alongside.
-
-### Overview & daily brief
-
-An **Overview** command-center tab leads the dashboard: a DEFCON-style
-**threat-level** header derived from current signal volume, plus the **Daily
-Brief** — top risks, newly-added KEV, what's hitting your stack, and top
-indicators. The brief renders as Markdown and as an **executive HTML email**
-(`/api/digest?format=html`), and a worker job composes it automatically each
-morning (07:00) — schedule-ready for delivery.
-
-### Export / interop
-
-Both grids export the **current filtered view**. Vulnerabilities export to CSV;
-indicators export to **CSV**, a **STIX 2.1 bundle** (importable into OpenCTI /
-MISP), a plain **blocklist** (IPs/domains/URLs/hashes) for firewalls and IDS, or
-**Sigma detection rules** for your SIEM — so OmniSight pushes intel into the rest
-of your stack rather than trapping it.
-
-### Analyst workflow
-
-- **IOC enrichment / pivoting** — click any IP to enrich live via Shodan
-  InternetDB (ports, hostnames, host CVEs), plus GreyNoise/AbuseIPDB when keyed,
-  with pivot links to VirusTotal/Shodan.
-- **My Stack alerts** — the worker notifies (Slack-style webhook and/or email)
-  when an exploited or high-risk CVE matches your stack; de-duplicated.
-- **Investigation notes + TLP** — attach TLP-marked notes to any CVE or IOC.
-- **ATT&CK techniques in intel** — ATT&CK/ATLAS technique IDs referenced across
-  ingested advisories and indicators, ranked by frequency and linked out.
-
-### Cross-source correlation
-
-The Overview surfaces **CVE↔IOC correlations**: CVE references found inside
-indicator tags/threat context are linked to tracked vulnerabilities (risk-ranked),
-showing which CVEs the active indicators relate to. (Linkage is only as rich as
-the feeds — IOC sources cite CVEs intermittently.) When an LLM is configured, an
-**AI correlation** view goes further — reasoning over the top CVEs and indicators
-to propose CVE↔IOC / campaign relationships with a confidence and rationale
-(suggestions to verify, not ground truth).
-
-### Daily brief email
-
-When SMTP is configured (`SMTP_HOST` + `DIGEST_TO` in `.env`), the worker emails
-the executive HTML brief each morning. Set `DIGEST_ON_START=true` to send a test
-on boot.
-
-### Real-time & enrichment
-
-- **Live updates** — the dashboard subscribes to `GET /api/stream` (Server-Sent
-  Events). When a feed ingests or enrichment runs, the change is pushed
-  instantly; if the stream drops, the client falls back to 15s polling. In
-  Postgres mode the worker signals the API via `LISTEN/NOTIFY`, so a separate
-  worker process still pushes to connected dashboards.
-- **EPSS** (keyless, bulk) runs in the worker every 30 min, and on demand via
-  `POST /api/enrich` (the dashboard's gauge button) so the no-worker demo can
-  pull live scores too.
-- **NVD CVSS** runs in the worker, throttled to the rate limit. Set `NVD_API_KEY`
-  in `.env` to raise it from 5→50 requests / 30s.
-
-## Architecture
-
-```
-apps/web      React + Vite dashboard (executive dark/light theme, icon buttons + tooltips)
-apps/api      Fastify REST API (+ admin "add feed" endpoints)
-apps/worker   BullMQ ingestion worker (schedules connectors on cron)
-packages/shared       Domain model + zod schemas + risk scoring (the shared language)
-packages/connectors   Connector SDK + CISA KEV + generic config-driven JSON connector
-packages/db           Repository: Postgres (prod) with an in-memory fallback (demo)
-```
-
-**Where data lives:** PostgreSQL is the system of record (sources + normalized
-signals, with full-text search built in — no ElasticSearch needed at this
-stage). Redis backs the job queue and short-lived caches. See
-[`docs/STORAGE.md`](docs/STORAGE.md).
+- **Keyless built-in scanner** — a TCP port sweep with service identification, HTTP banner/version-disclosure detection,
+  and missing-security-header checks. No external tools required; works in the zero-dependency demo.
+- **Pluggable adapter contract** — external engines implement one interface. An optional **nuclei** adapter runs only
+  when `SCANNER_NUCLEI=true` and the binary is on `PATH`, with its CVE classifications flowing into findings.
+- **Correlation + asset discovery** — discovered products are matched to tracked CVEs (extra findings carry the CVE and
+  its risk), and the scanned host is registered as an asset — closing the loop back into Phase 2.
+- **Ad-hoc or scheduled** — run on demand from the dashboard, or save a target with a cron for the worker to scan on
+  schedule. *Only scan systems you are authorized to test.*
 
 ## Quick start
 
@@ -193,55 +133,181 @@ stage). Redis backs the job queue and short-lived caches. See
 
 ```bash
 pnpm install
-pnpm start:api          # seeds demo data from the CISA KEV fixture (in-memory)
-pnpm --filter @omnisight/web dev   # dashboard at http://localhost:5173
+pnpm start:api                      # seeds demo data from the CISA KEV fixture (in-memory)
+pnpm --filter @omnisight/web dev    # dashboard at http://localhost:5173
 ```
 
 ### Full stack (Postgres + Redis + live ingestion)
 
 ```bash
 cp .env.example .env
-docker compose up -d            # Postgres + Redis
+docker compose up -d                # Postgres + Redis
 pnpm install
-pnpm start:api                  # API on :4000
-pnpm start:worker               # ingests CISA KEV live, on a 6h cron
-pnpm --filter @omnisight/web dev
+pnpm start:api                      # API on :4000
+pnpm start:worker                   # ingests feeds on cron, runs scheduled scans + syslog
+pnpm --filter @omnisight/web dev    # dashboard
 ```
 
-### Verify the ingest pipeline without anything running
+### Verify the ingest pipeline offline
 
 ```bash
-pnpm connector:dry-run --fixture   # offline, uses bundled sample
-pnpm connector:dry-run             # live fetch from CISA
+pnpm connector:dry-run --fixture    # offline, bundled sample
+pnpm connector:dry-run              # live fetch from CISA
 ```
 
-## Adding feeds (admin)
+> **Requirements:** Node ≥ 20 and pnpm. After pulling new code, run `pnpm install` so workspace packages
+> (including `@omnisight/scanner`) are linked.
 
-High-value feeds ship as built-in connectors. For the long tail, an admin can
-register a feed at runtime — no code, no redeploy — via the dashboard's **Add
-feed** panel or the API:
+## Architecture
+
+A pnpm + Turborepo monorepo — one language end to end, from feed to pixel.
+
+```
+apps/web        React + Vite dashboard (executive dark/light theme, icon buttons + tooltips, SSE live updates)
+apps/api        Fastify REST API (+ admin "add feed", assets, events, scans endpoints)
+apps/worker     BullMQ worker: connectors on cron + enrichment + scheduled scans + syslog listener
+packages/shared       Domain model + zod schemas + risk scoring + exporters (the shared language)
+packages/connectors   Connector SDK + built-in connectors + generic config-driven RSS/JSON/TAXII connectors
+packages/scanner      Pluggable scan adapters: keyless built-in scanner + optional nuclei + scan runner
+packages/db           Repository: PostgreSQL (prod) with an in-memory fallback (demo); one Repository interface
+```
+
+```
+                 ┌──────────────────────────────────────────────┐
+   feeds ───────►│ connectors ─► normalized (zod) ─► repository  │◄── assets / events / scans
+ (HTTP/RSS/JSON/ │                                      │        │
+   TAXII)        └──────────────────────────────────────┼────────┘
+                                                         ▼
+   scan targets ─► packages/scanner ─► findings ─► PostgreSQL ──read──► Fastify API ──SSE──► React dashboard
+                                                         ▲
+                                              Redis + BullMQ worker (cron, enrichment, scans, syslog)
+```
+
+**Key choices:** PostgreSQL is the single system of record (full-text search + `JSONB` cover current needs — no
+ElasticSearch); Redis backs the BullMQ queue and short-lived caches; a shared TypeScript types package gives end-to-end
+type safety; the API is contract-first (Fastify + zod). The same `Repository` interface has a Postgres implementation and
+an in-memory one, so the API and worker code is identical in demo and production.
+
+## Configuration
+
+All configuration is via environment variables (see [`.env.example`](.env.example)). Everything is optional except where
+noted — the platform runs open, keyless, and in-memory out of the box.
+
+| Variable | Purpose |
+|----------|---------|
+| `DATABASE_URL` | PostgreSQL connection. **Unset → in-memory demo store** seeded from the CISA KEV fixture. |
+| `REDIS_URL` | Queue + cache. Required by the worker; optional for the API. |
+| `API_PORT` | API port (default `4000`). |
+| `AUTH_ENABLED`, `JWT_SECRET`, `JWT_EXPIRY_HOURS` | Opt-in auth. Off by default (open). |
+| `ADMIN_USER`, `ADMIN_PASS` | Seed an initial admin on first boot when auth is on. |
+| `OIDC_*`, `APP_URL` | Generic OIDC SSO (authorization-code flow); first-time users auto-provisioned as viewers. |
+| `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | Optional AI layer — any OpenAI-compatible endpoint or local Ollama. |
+| `NVD_API_KEY` | Raises NVD rate limit 5→50 req/30s. |
+| `ABUSECH_AUTH_KEY`, `OTX_API_KEY`, `PULSEDIVE_API_KEY` | Free keys that unlock the respective indicator connectors. |
+| `GREYNOISE_API_KEY`, `ABUSEIPDB_API_KEY` | Optional IOC-enrichment providers (Shodan InternetDB is keyless). |
+| `TAXII_TOKEN` / `TAXII_USER` / `TAXII_PASS` | Global fallback auth for TAXII feeds (per-feed auth lives in source config). |
+| `HIBP_DOMAINS`, `HIBP_API_KEY` | Breach-exposure monitoring via Have I Been Pwned (free public collection; key optional). |
+| `SMTP_*`, `DIGEST_TO`, `DIGEST_ON_START` | Daily-brief email delivery. |
+| `ALERT_WEBHOOK`, `ALERT_TO`, `ALERT_MIN_RISK` | Default stack-alert routing (used when no automation rules exist). |
+| `JIRA_*` | SOAR-lite: open a Jira issue per stack-affecting vuln. |
+| `DECAY_PRUNE_DAYS` | Prune indicators not seen in N days (default 180). |
+| `SYSLOG_ENABLED`, `SYSLOG_PORT` | **Phase 2** — opt-in syslog listener for environment-event IOC matching. |
+| `EVENTS_PRUNE_DAYS` | **Phase 2** — environment-event retention (default 30). |
+| `SCANNER_NUCLEI` | **Phase 3** — also use nuclei when the binary is present (built-in scanner is always on). |
+
+## Data sources
+
+OmniSight ships seeded with high-signal, mostly-keyless feeds and lets you add the long tail at runtime.
+
+| Type | Built-in / seeded | Access |
+|------|-------------------|--------|
+| Vulnerabilities | CISA KEV, NVD recent CVEs | keyless (NVD key optional) |
+| Indicators | abuse.ch ThreatFox, AlienVault OTX, Pulsedive | free key each |
+| Enrichment | EPSS, NVD CVSS, ipwho.is geo, OSV (SBOM) | keyless |
+| Knowledge | MITRE ATT&CK / ATLAS | keyless |
+| News / advisories | The Hacker News, Dark Reading, SecurityWeek-AI, **Ars Technica Security**, **BleepingComputer** | keyless RSS |
+| Breach exposure | Have I Been Pwned (free public breaches collection) | keyless (key optional) |
+
+Respect each source's license and rate limits. abuse.ch is free for non-commercial/community use; some vendor feeds carry
+attribution requirements.
+
+## Adding feeds at runtime
+
+Admins can register a feed from the dashboard's **Add feed** panel (or `POST /api/sources`) — no code, no redeploy:
+
+- **RSS / Atom (news & advisories)** — paste any feed URL (e.g. `https://feeds.arstechnica.com/arstechnica/security`).
+  Articles appear in the **News** tab.
+- **Generic JSON (vulnerabilities)** — point at any JSON feed, set the array path, and OmniSight maps fields into its model.
+- **TAXII 2.1 (indicators)** — poll a collection's objects endpoint on a schedule (Bearer or Basic auth per feed).
 
 ```bash
 curl -X POST localhost:4000/api/sources -H 'content-type: application/json' -d '{
-  "name": "Example CVE feed",
-  "kind": "json",
-  "signalType": "vulnerability",
-  "url": "https://example.com/feed.json",
-  "config": { "itemsPath": "vulnerabilities",
-              "map": { "id": "cveID", "title": "name", "vendor": "vendorProject" } }
+  "name": "Ars Technica — Security", "kind": "rss", "signalType": "advisory",
+  "url": "https://feeds.arstechnica.com/arstechnica/security"
 }'
 ```
 
-The generic JSON connector fetches the URL, walks `itemsPath` to the array, and
-maps fields into OmniSight's model.
+## API overview
 
-## Docs
+A selection of the REST surface (all under `/api`):
 
-- [`docs/SPEC.md`](docs/SPEC.md) — product spec, positioning, roadmap
-- [`docs/DATA_SOURCES.md`](docs/DATA_SOURCES.md) — feed catalog with access details
-- [`docs/FEATURES.md`](docs/FEATURES.md) — feature backlog for security pros
-- [`docs/STORAGE.md`](docs/STORAGE.md) — data storage model
+| Area | Endpoints |
+|------|-----------|
+| Signals | `GET /vulnerabilities`, `GET /indicators`, `GET /advisories`, `GET /stats`, `GET /stream` (SSE) |
+| Correlation | `GET /correlations`, `GET /entities`, `GET /attack`, `GET /attack/matrix`, `GET /actors` |
+| Assets (P2) | `GET/POST /assets`, `PATCH/DELETE /assets/:id`, `POST /assets/import/csv`, `POST /assets/import/sbom`, `GET /asset-matches` |
+| Events (P2) | `POST /events` (JSON / NDJSON / text), `GET /events`, `GET /events/stats` |
+| Scanning (P3) | `GET /scan/config`, `GET/POST /scan/targets`, `POST /scan/run`, `GET /scans`, `GET /scans/:id`, `GET /findings` |
+| Workflow | `/notes`, `/feedback`, `/searches`, `/rfis`, `/rules`, `/detection-rules`, `/watchlist` |
+| Interop | `/sbom`, `/import/stix`, `/enrich/ioc`, `/digest`, `*/export` |
+| AI (optional) | `/ai/summarize`, `/ai/query`, `/ai/correlate` |
+| Auth | `/auth/login`, `/auth/me`, `/auth/sso/*`, `/users`, `/audit` |
+
+## Exports & interop
+
+Both grids export the current filtered view. Vulnerabilities → **CSV**. Indicators → **CSV**, **STIX 2.1** bundle
+(importable into OpenCTI/MISP), a plain **blocklist** (IPs/domains/URLs/hashes) for firewalls/IDS, **Sigma**, **YARA**, and
+**Snort/Suricata** rules. The asset inventory exports to **CSV**. OmniSight pushes intel into the rest of your stack
+rather than trapping it.
+
+## Authentication & roles
+
+Off by default (open). Set `AUTH_ENABLED=true` + `JWT_SECRET` and seed an admin to require login. Three roles — **viewer**
+(read-only), **analyst** (notes, watchlist, enrich, import, assets, events, scans), **admin** (+ manage sources, users,
+rules). Local username/password (scrypt-hashed) with JWTs; RBAC enforced server-side and reflected in the UI. **SSO** via a
+generic OIDC authorization-code flow auto-provisions first-time users as viewers. An admin-only **audit log** records
+mutating actions and logins.
+
+## Deployment
+
+`docker compose up` brings up Postgres + Redis; run the API, worker, and web app with the commands above. The platform
+runs with zero API keys on public feeds; optional keys unlock premium sources. For production, set `DATABASE_URL` /
+`REDIS_URL`, enable auth (`AUTH_ENABLED`, `JWT_SECRET`, admin seed), and configure SMTP for the daily brief. The scaling
+path (only if needed) is partitioning high-volume tables, adding OpenSearch as a read replica for search, and API read
+replicas — none required to start.
+
+## Roadmap
+
+| Phase | Scope | Status |
+|-------|-------|--------|
+| **1** | Threat-intel dashboard — aggregate, correlate, score, alert | ✅ shipped |
+| **2** | Defensive monitoring — asset inventory + CVE matching, environment-event/IOC matching | ✅ shipped |
+| **3** | Vulnerability scanning — built-in + pluggable engines, findings correlated to CVEs/assets | ✅ shipped |
+| Ongoing | Connector SDK + docs, STIX/TAXII interop, demo instance, good-first-issues | ↻ continuous |
+
+## Contributing
+
+Contributions are welcome — new connectors, scan adapters, and dashboard improvements especially. The connector SDK
+(`packages/connectors`) and scan-adapter contract (`packages/scanner`) are intentionally small. Please run
+`pnpm typecheck` before opening a PR and keep new data sources documented with their access terms.
+
+## Security & responsible use
+
+The vulnerability scanner performs active network probing. **Only scan hosts and applications you own or are explicitly
+authorized to test.** OmniSight is provided under Apache-2.0 **without warranty**; you are responsible for complying with
+the terms of every data source you connect and with applicable law. To report a security issue, please open a private
+advisory rather than a public issue.
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
+**Apache-2.0** — see [LICENSE](LICENSE).

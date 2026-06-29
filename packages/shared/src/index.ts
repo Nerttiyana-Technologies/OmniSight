@@ -1,3 +1,8 @@
+// noinspection HtmlDeprecatedAttribute,CssInvalidPropertyValue
+// ^ The digest email template (digestHtml) intentionally uses table-layout
+//   attributes (cellpadding/cellspacing/align/valign/width) required by email
+//   clients, and its inline styles contain ${...} interpolation that WebStorm
+//   mis-parses as static CSS. Both are correct for email; suppress the noise.
 import { z } from "zod";
 
 /**
@@ -254,11 +259,11 @@ export interface ExtractedIocs {
 /** Undo common defanging: 1[.]2 -> 1.2, hxxp -> http, [@] -> @, etc. */
 export function refang(text: string): string {
   return text
-    .replace(/\[\s*\.\s*\]|\(\s*\.\s*\)|\{\s*\.\s*\}|\[dot\]/gi, ".")
-    .replace(/\[\s*:\s*\]/g, ":")
-    .replace(/\[\s*\/\s*\]/g, "/")
-    .replace(/\[\s*@\s*\]|\(at\)|\[at\]/gi, "@")
-    .replace(/h\s*x\s*x\s*p(s?)\s*(?::|\[:\])\/\//gi, "http$1://")
+    .replace(/\[\s*\.\s*]|\(\s*\.\s*\)|{\s*\.\s*}|\[dot]/gi, ".")
+    .replace(/\[\s*:\s*]/g, ":")
+    .replace(/\[\s*\/\s*]/g, "/")
+    .replace(/\[\s*@\s*]|\(at\)|\[at]/gi, "@")
+    .replace(/h\s*x\s*x\s*p(s?)\s*(?::|\[:])\/\//gi, "http$1://")
     .replace(/\bfxp\b/gi, "ftp");
 }
 
@@ -759,7 +764,7 @@ function digestHtml(date: string, headline: string, sections: DigestSection[]): 
   }).join("");
 
   return `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#f4f6fa;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
   <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background:#f4f6fa;padding:24px 0;">
     <tr><td align="center">
@@ -781,3 +786,374 @@ function digestHtml(date: string, headline: string, sections: DigestSection[]): 
   </table>
 </body></html>`;
 }
+
+// ===========================================================================
+// Phase 2 — Defensive monitoring: asset inventory
+// ===========================================================================
+
+export const ASSET_KINDS = ["host", "service", "software", "cloud", "network", "other"] as const;
+export type AssetKind = (typeof ASSET_KINDS)[number];
+
+export const CRITICALITIES = ["low", "medium", "high", "critical"] as const;
+export type Criticality = (typeof CRITICALITIES)[number];
+
+export const ASSET_ORIGINS = ["manual", "csv", "sbom", "scan"] as const;
+export type AssetOrigin = (typeof ASSET_ORIGINS)[number];
+
+/**
+ * A tracked asset in the defender's environment. Incoming threat intel is
+ * matched against these to answer "does this CVE affect something we run?".
+ * "My Stack" (a flat list of terms) is the lightweight view over this inventory.
+ */
+export const AssetSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  kind: z.enum(ASSET_KINDS).default("software"),
+  vendor: z.string().nullable().default(null),
+  product: z.string().nullable().default(null),
+  version: z.string().nullable().default(null),
+  cpe: z.string().nullable().default(null), // CPE 2.3 (or 2.2 URI) when known
+  ip: z.string().nullable().default(null),
+  hostname: z.string().nullable().default(null),
+  owner: z.string().nullable().default(null),
+  criticality: z.enum(CRITICALITIES).default("medium"),
+  tags: z.array(z.string()).default([]),
+  origin: z.enum(ASSET_ORIGINS).default("manual"),
+  createdAt: z.string().nullable().optional(),
+  updatedAt: z.string().nullable().optional(),
+});
+export type Asset = z.infer<typeof AssetSchema>;
+
+/** Input shape for creating/importing an asset (id + timestamps are assigned by the store). */
+export const NewAssetSchema = AssetSchema.omit({ id: true, createdAt: true, updatedAt: true }).extend({
+  id: z.string().optional(),
+});
+export type NewAsset = z.infer<typeof NewAssetSchema>;
+
+export interface ParsedCpe {
+  part: string; // a (application) | o (os) | h (hardware) | *
+  vendor: string;
+  product: string;
+  version: string;
+}
+
+/** Parse a CPE 2.3 formatted string or a 2.2 URI into its key fields. */
+export function parseCpe(cpe: string | null | undefined): ParsedCpe | null {
+  if (!cpe) return null;
+  const s = cpe.trim().toLowerCase();
+  const field = (v: string | undefined) => (v && v !== "*" && v !== "-" ? v.replace(/\\/g, "") : "*");
+  if (s.startsWith("cpe:2.3:")) {
+    const p = s.slice(8).split(":");
+    if (p.length < 4) return null;
+    return { part: field(p[0]), vendor: field(p[1]), product: field(p[2]), version: field(p[3]) };
+  }
+  if (s.startsWith("cpe:/")) {
+    const p = s.slice(5).split(":");
+    return { part: field(p[0]), vendor: field(p[1]), product: field(p[2]), version: field(p[3]) };
+  }
+  return null;
+}
+
+export type AssetMatchType = "cpe" | "vendor-product" | "term";
+
+export interface AssetMatchResult {
+  match: boolean;
+  type: AssetMatchType | null;
+  reason: string;
+}
+
+function vulnHaystack(v: { vendor: string | null; product: string | null; title: string }): string {
+  return `${v.vendor ?? ""} ${v.product ?? ""} ${v.title}`.toLowerCase();
+}
+
+/**
+ * Decide whether a vulnerability affects an asset, and how confidently.
+ * Precedence: CPE vendor+product (strongest) → asset vendor+product → single term.
+ * Version is informational (CVE feeds rarely carry reliable affected-version ranges).
+ */
+export function assetMatchesVuln(
+  asset: Pick<Asset, "vendor" | "product" | "version" | "cpe" | "name">,
+  v: { vendor: string | null; product: string | null; title: string },
+): AssetMatchResult {
+  const hay = vulnHaystack(v);
+  const has = (t: string | null | undefined) => Boolean(t && t.trim() && hay.includes(t.trim().toLowerCase()));
+  const cpe = parseCpe(asset.cpe);
+  if (cpe && cpe.vendor !== "*" && cpe.product !== "*" && has(cpe.vendor) && has(cpe.product)) {
+    const ver = asset.version ? ` (running ${asset.version})` : "";
+    return { match: true, type: "cpe", reason: `CPE ${cpe.vendor}:${cpe.product}${ver}` };
+  }
+  if (has(asset.vendor) && has(asset.product)) {
+    return { match: true, type: "vendor-product", reason: `vendor/product ${asset.vendor}/${asset.product}` };
+  }
+  for (const term of [asset.product, asset.name, asset.vendor]) {
+    if (has(term)) return { match: true, type: "term", reason: `matched "${(term ?? "").trim()}"` };
+  }
+  return { match: false, type: null, reason: "" };
+}
+
+/** Lower-cased candidate match terms an asset contributes to "My Stack" matching. */
+export function assetSearchTerms(asset: Pick<Asset, "vendor" | "product" | "name" | "cpe">): string[] {
+  const out = new Set<string>();
+  const add = (t: string | null | undefined) => { const s = (t ?? "").trim().toLowerCase(); if (s.length > 2) out.add(s); };
+  add(asset.vendor); add(asset.product); add(asset.name);
+  const cpe = parseCpe(asset.cpe);
+  if (cpe) { if (cpe.vendor !== "*") add(cpe.vendor); if (cpe.product !== "*") add(cpe.product); }
+  return [...out];
+}
+
+const ASSET_CSV_COLS = ["name", "kind", "vendor", "product", "version", "cpe", "ip", "hostname", "owner", "criticality", "tags"] as const;
+
+export function assetsToCsv(items: Asset[]): string {
+  return toCsv(
+    [...ASSET_CSV_COLS],
+    items.map((a) => [
+      a.name, a.kind, a.vendor, a.product, a.version, a.cpe, a.ip, a.hostname,
+      a.owner, a.criticality, a.tags.join("|"),
+    ]),
+  );
+}
+
+/** Split a single CSV line honoring double-quoted fields. */
+function splitCsvLine(line: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]!;
+    if (inQ) {
+      if (c === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else inQ = false; }
+      else cur += c;
+    } else if (c === '"') inQ = true;
+    else if (c === ",") { out.push(cur); cur = ""; }
+    else cur += c;
+  }
+  out.push(cur);
+  return out;
+}
+
+/**
+ * Parse an asset CSV (header row required, any subset/order of the known
+ * columns; `tags` is pipe- or semicolon-delimited). Rows without a name are skipped.
+ */
+export function parseAssetsCsv(text: string): NewAsset[] {
+  const lines = text.replace(/\r/g, "").split("\n").filter((l) => l.trim());
+  if (lines.length < 2) return [];
+  const header = splitCsvLine(lines[0]!).map((h) => h.trim().toLowerCase());
+  const idx = (name: string) => header.indexOf(name);
+  const out: NewAsset[] = [];
+  for (const line of lines.slice(1)) {
+    const cells = splitCsvLine(line);
+    const get = (name: string) => { const i = idx(name); return i >= 0 ? (cells[i] ?? "").trim() : ""; };
+    const name = get("name") || get("product") || get("hostname");
+    if (!name) continue;
+    const kind = (ASSET_KINDS as readonly string[]).includes(get("kind")) ? (get("kind") as AssetKind) : "software";
+    const crit = (CRITICALITIES as readonly string[]).includes(get("criticality")) ? (get("criticality") as Criticality) : "medium";
+    const tags = get("tags").split(/[|;]/).map((t) => t.trim()).filter(Boolean);
+    out.push({
+      name, kind, criticality: crit, tags, origin: "csv",
+      vendor: get("vendor") || null, product: get("product") || null, version: get("version") || null,
+      cpe: get("cpe") || null, ip: get("ip") || null, hostname: get("hostname") || null, owner: get("owner") || null,
+    });
+  }
+  return out;
+}
+
+// ===========================================================================
+// Phase 2 — Defensive monitoring: environment events (log/IOC matching)
+// ===========================================================================
+
+export const EVENT_KINDS = ["ip", "domain", "url", "hash"] as const;
+export type EventKind = (typeof EVENT_KINDS)[number];
+
+export const EVENT_SEVERITIES = ["info", "low", "medium", "high", "critical"] as const;
+export type EventSeverity = (typeof EVENT_SEVERITIES)[number];
+
+/** A single observable seen in the defender's environment (from a log/sensor/push). */
+export interface MonitorEvent {
+  id: string;
+  sensor: string;             // log source / sensor name
+  kind: EventKind;
+  value: string;              // normalized observable
+  host: string | null;        // affected host/asset, when known
+  observedAt: string | null;
+  raw: string | null;         // short raw snippet for context
+  matched: boolean;           // true when it hit a tracked indicator
+  matchedSource: string | null;
+  malware: string | null;
+  severity: EventSeverity;
+  createdAt: string;
+}
+
+/** A parsed observable plus its event context, before IOC matching. */
+export interface ParsedObservable {
+  sensor: string;
+  host: string | null;
+  observedAt: string | null;
+  kind: EventKind;
+  value: string;
+  raw: string | null;
+}
+
+/** Canonicalize an observable for comparison against indicators. */
+export function normalizeObservable(kind: EventKind, value: string): string {
+  const v = value.trim();
+  switch (kind) {
+    case "ip": return ipOnly(v).toLowerCase();
+    case "domain": return v.toLowerCase().replace(/\.$/, "");
+    case "url": return v.replace(/^hxxp/i, "http").trim();
+    case "hash": return v.toLowerCase();
+    default: return v;
+  }
+}
+
+const OBS_FIELDS: Record<EventKind, string[]> = {
+  ip: ["ip", "src_ip", "source_ip", "dst_ip", "dest_ip", "destination_ip", "remote_ip", "client_ip", "ipv4"],
+  domain: ["domain", "host", "hostname", "dns_query", "query", "fqdn"],
+  url: ["url", "uri", "request_url", "http_url"],
+  hash: ["hash", "md5", "sha1", "sha256", "filehash", "file_hash"],
+};
+
+function eventMeta(o: Record<string, unknown>): { sensor: string; host: string | null; observedAt: string | null } {
+  const str = (k: string) => (typeof o[k] === "string" ? (o[k] as string) : undefined);
+  const sensor = str("sensor") || str("source") || str("logsource") || str("product") || "push";
+  const host = str("host") || str("hostname") || str("device") || str("computer") || null;
+  const observedAt = str("timestamp") || str("time") || str("@timestamp") || str("observedAt") || str("date") || null;
+  return { sensor, host, observedAt };
+}
+
+/** Pull observables out of one structured event object (typed fields first, then free-text fields). */
+function observablesFromObject(o: Record<string, unknown>): ParsedObservable[] {
+  const meta = eventMeta(o);
+  const found = new Map<string, ParsedObservable>();
+  const push = (kind: EventKind, raw: string, context: string | null) => {
+    const value = normalizeObservable(kind, raw);
+    if (!value) return;
+    const key = `${kind}:${value}`;
+    if (!found.has(key)) found.set(key, { ...meta, kind, value, raw: context });
+  };
+  for (const kind of EVENT_KINDS) {
+    for (const f of OBS_FIELDS[kind]) {
+      const val = o[f];
+      if (typeof val === "string" && val.trim()) push(kind, val, val);
+    }
+  }
+  // Free-text fields: extract anything embedded.
+  for (const f of ["message", "msg", "raw", "log", "text", "description"]) {
+    const val = o[f];
+    if (typeof val === "string" && val.trim()) {
+      const ex = extractIocs(val);
+      const snippet = val.slice(0, 300);
+      ex.ips.forEach((v) => push("ip", v, snippet));
+      ex.domains.forEach((v) => push("domain", v, snippet));
+      ex.urls.forEach((v) => push("url", v, snippet));
+      ex.hashes.forEach((v) => push("hash", v, snippet));
+    }
+  }
+  return [...found.values()];
+}
+
+/**
+ * Parse arbitrary event input into observables. Accepts a JSON object, an array
+ * of objects, NDJSON, CSV-ish, or free-form log text (one entry per line).
+ */
+export function parseEvents(input: unknown): ParsedObservable[] {
+  if (input == null) return [];
+  if (Array.isArray(input)) return input.flatMap((e) => parseEvents(e));
+  if (typeof input === "object") return observablesFromObject(input as Record<string, unknown>);
+  if (typeof input !== "string") return [];
+  const text = input.trim();
+  if (!text) return [];
+  // Try whole-body JSON first.
+  if (text.startsWith("{") || text.startsWith("[")) {
+    try { return parseEvents(JSON.parse(text)); } catch { /* fall through to line mode */ }
+  }
+  const out: ParsedObservable[] = [];
+  for (const line of text.split("\n")) {
+    const l = line.trim();
+    if (!l) continue;
+    if (l.startsWith("{")) {
+      try { out.push(...parseEvents(JSON.parse(l))); continue; } catch { /* not JSON, treat as text */ }
+    }
+    const ex = extractIocs(l);
+    const snippet = l.slice(0, 300);
+    ex.ips.forEach((v) => out.push({ sensor: "log", host: null, observedAt: null, kind: "ip", value: normalizeObservable("ip", v), raw: snippet }));
+    ex.domains.forEach((v) => out.push({ sensor: "log", host: null, observedAt: null, kind: "domain", value: normalizeObservable("domain", v), raw: snippet }));
+    ex.urls.forEach((v) => out.push({ sensor: "log", host: null, observedAt: null, kind: "url", value: normalizeObservable("url", v), raw: snippet }));
+    ex.hashes.forEach((v) => out.push({ sensor: "log", host: null, observedAt: null, kind: "hash", value: normalizeObservable("hash", v), raw: snippet }));
+  }
+  return out;
+}
+
+// ===========================================================================
+// Phase 3 — Vulnerability scanning
+// ===========================================================================
+
+export const SCAN_SEVERITIES = ["info", "low", "medium", "high", "critical"] as const;
+export type ScanSeverity = (typeof SCAN_SEVERITIES)[number];
+
+export const SCAN_TARGET_KINDS = ["host", "url"] as const;
+export type ScanTargetKind = (typeof SCAN_TARGET_KINDS)[number];
+
+export const SCAN_STATUSES = ["queued", "running", "done", "error"] as const;
+export type ScanStatus = (typeof SCAN_STATUSES)[number];
+
+/** A host or URL the scanner is configured to assess. */
+export const ScanTargetSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  target: z.string(), // host / ip / url
+  kind: z.enum(SCAN_TARGET_KINDS).default("host"),
+  adapter: z.string().default("builtin"),
+  enabled: z.boolean().default(true),
+  schedule: z.string().nullable().default(null), // cron; null = manual only
+  createdAt: z.string().nullable().optional(),
+  lastScanAt: z.string().nullable().optional(),
+});
+export type ScanTarget = z.infer<typeof ScanTargetSchema>;
+
+export const NewScanTargetSchema = ScanTargetSchema.omit({ id: true, createdAt: true, lastScanAt: true }).extend({
+  id: z.string().optional(),
+});
+export type NewScanTarget = z.infer<typeof NewScanTargetSchema>;
+
+/** A single scan run against one target. */
+export interface Scan {
+  id: string;
+  targetId: string | null;
+  target: string;
+  adapter: string;
+  status: ScanStatus;
+  startedAt: string | null;
+  finishedAt: string | null;
+  findingCount: number;
+  openPorts: number;
+  cveCount: number;
+  error: string | null;
+  createdAt: string;
+}
+
+/** A single finding produced by a scan. */
+export interface ScanFinding {
+  id: string;
+  scanId: string;
+  target: string;
+  host: string | null;
+  port: number | null;
+  service: string | null;
+  product: string | null;
+  version: string | null;
+  cpe: string | null;
+  cve: string | null;
+  severity: ScanSeverity;
+  title: string;
+  description: string;
+  evidence: string | null;
+  createdAt: string;
+}
+
+/** A raw finding emitted by a scan adapter, before persistence assigns ids. */
+export type RawScanFinding = Omit<ScanFinding, "id" | "scanId" | "createdAt">;
+
+const SEV_RANK: Record<ScanSeverity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
+/** Compare scan severities (higher = more severe), e.g. for sorting findings. */
+export function severityRank(s: ScanSeverity): number { return SEV_RANK[s] ?? 0; }

@@ -99,7 +99,10 @@ body {
 
 main { width: 100%; margin: 0; padding: 28px 40px; }
 
-.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 16px; margin-bottom: 28px; }
+/* 12 stat cards lay out as an even 6×2; steps down evenly (4×3, 3×4, 2×6). */
+.stat-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 16px; margin-bottom: 28px; }
+@media (max-width: 1180px) { .stat-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@media (max-width: 900px)  { .stat-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 .stat-card {
   background: var(--bg-elev);
   border: 1px solid var(--border);

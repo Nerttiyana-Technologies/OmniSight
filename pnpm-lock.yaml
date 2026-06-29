@@ -26,6 +26,9 @@ importers:
       '@omnisight/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@omnisight/scanner':
+        specifier: workspace:*
+        version: link:../../packages/scanner
       '@omnisight/shared':
         specifier: workspace:*
         version: link:../../packages/shared
@@ -79,6 +82,9 @@ importers:
       '@omnisight/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@omnisight/scanner':
+        specifier: workspace:*
+        version: link:../../packages/scanner
       '@omnisight/shared':
         specifier: workspace:*
         version: link:../../packages/shared
@@ -89,8 +95,8 @@ importers:
         specifier: ^5.4.1
         version: 5.11.1
       nodemailer:
-        specifier: ^6.9.16
-        version: 6.10.1
+        specifier: 8.0.5
+        version: 8.0.5
     devDependencies:
       '@types/nodemailer':
         specifier: ^6.4.17
@@ -127,6 +133,16 @@ importers:
       '@types/pg':
         specifier: ^8.11.10
         version: 8.20.0
+      typescript:
+        specifier: ^5.6.3
+        version: 5.9.3
+
+  packages/scanner:
+    dependencies:
+      '@omnisight/shared':
+        specifier: workspace:*
+        version: link:../shared
+    devDependencies:
       typescript:
         specifier: ^5.6.3
         version: 5.9.3
@@ -1060,8 +1076,8 @@ packages:
     resolution: {integrity: sha512-J6l92tKHX6w8Jy5nO1Vuc01NoIiRGi/d6qBKVxh+IQ8Cr3b6HbVNfKiF8ZpFKufTwpwxMmce2W3iQZ861ZRyTg==}
     engines: {node: '>=18'}
 
-  nodemailer@6.10.1:
-    resolution: {integrity: sha512-Z+iLaBGVaSjbIzQ4pX6XV41HrooLsQ10ZWPUehGmuantvzWoDVBnmsdUcOIDM1t+yPor5pDhVlDESgOMEGxhHA==}
+  nodemailer@8.0.5:
+    resolution: {integrity: sha512-0PF8Yb1yZuQfQbq+5/pZJrtF6WQcjTd5/S4JOHs9PGFxuTqoB/icwuB44pOdURHJbRKX1PPoJZtY7R4VUoCC8w==}
     engines: {node: '>=6.0.0'}
 
   obliterator@2.0.5:
@@ -2113,7 +2129,7 @@ snapshots:
 
   node-releases@2.0.50: {}
 
-  nodemailer@6.10.1: {}
+  nodemailer@8.0.5: {}
 
   obliterator@2.0.5: {}
 
