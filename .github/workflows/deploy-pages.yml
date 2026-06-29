@@ -48,7 +48,7 @@ jobs:
 
       # Pages must be enabled once manually: Settings → Pages → Source: "GitHub Actions".
       # (The default token usually can't create the Pages site programmatically.)
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v6
 
       - uses: actions/upload-pages-artifact@v3
         with:
