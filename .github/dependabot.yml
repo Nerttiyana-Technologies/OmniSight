@@ -1,0 +1,44 @@
+version: 2
+updates:
+  # npm/pnpm dependencies across the monorepo (Dependabot reads the root lockfile).
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+    groups:
+      # One PR for routine dev-tooling bumps instead of many.
+      dev-toolchain:
+        patterns:
+          - "vite"
+          - "@vitejs/*"
+          - "esbuild"
+          - "turbo"
+          - "tsx"
+          - "typescript"
+          - "@types/*"
+        update-types:
+          - minor
+          - patch
+      production:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "vite"
+          - "@vitejs/*"
+          - "esbuild"
+          - "turbo"
+          - "tsx"
+          - "typescript"
+          - "@types/*"
+
+  # Keep the GitHub Actions in the Pages workflow current too.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - github-actions
