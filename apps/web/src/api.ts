@@ -1,4 +1,9 @@
-import type { Vulnerability, Indicator, Advisory, Source, NewSource, Digest, User } from "@omnisight/shared";
+import type {
+  Vulnerability, Indicator, Advisory, Source, NewSource, Digest, User,
+  Asset, NewAsset, MonitorEvent, ScanTarget, NewScanTarget, Scan, ScanFinding,
+} from "@omnisight/shared";
+
+export type { Asset, NewAsset, MonitorEvent, ScanTarget, Scan, ScanFinding } from "@omnisight/shared";
 
 export interface Stats {
   total: number;
@@ -10,7 +15,34 @@ export interface Stats {
   indicators: number;
   advisories: number;
   inStack: number;
+  assets: number;
+  eventsMatched: number;
+  findings: number;
 }
+
+// --- Phase 2: assets ---
+export interface AssetPage { items: Asset[]; total: number; page: number; pageSize: number }
+export interface AssetMatch {
+  assetId: string;
+  assetName: string;
+  criticality: "low" | "medium" | "high" | "critical";
+  cve: string;
+  title: string;
+  riskScore: number;
+  knownExploited: boolean;
+  matchType: "cpe" | "vendor-product" | "term";
+  reason: string;
+}
+
+// --- Phase 2: events ---
+export interface EventPage { items: MonitorEvent[]; total: number; page: number; pageSize: number }
+export interface EventStats { total: number; matched: number; last24h: number }
+export interface EventIngestResult { inserted: number; matched: number }
+
+// --- Phase 3: scans ---
+export interface FindingPage { items: ScanFinding[]; total: number; page: number; pageSize: number }
+export interface FindingStats { total: number; withCve: number; critical: number; high: number }
+export interface ScanAdapterInfo { id: string; name: string }
 
 export interface IndicatorQuery {
   page?: number;
@@ -426,6 +458,59 @@ export const api = {
   removeWatch: (term: string) =>
     af(`/api/watchlist/${encodeURIComponent(term)}`, { method: "DELETE" }).then(json<string[]>),
   enrich: () => af("/api/enrich", { method: "POST" }).then(json<{ enriched: number }>),
+
+  // --- Phase 2: assets ---
+  assets: (params: { page?: number; pageSize?: number; q?: string; kind?: string; criticality?: string; origin?: string } = {}) => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) if (v != null && v !== "") qs.set(k, String(v));
+    return af(`/api/assets?${qs}`).then(json<AssetPage>);
+  },
+  createAsset: (body: Partial<NewAsset>) =>
+    af("/api/assets", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).then(json<Asset>),
+  updateAsset: (id: string, patch: Partial<NewAsset>) =>
+    af(`/api/assets/${id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(patch) }).then(json<{ ok: boolean }>),
+  deleteAsset: (id: string) => af(`/api/assets/${id}`, { method: "DELETE" }).then(json<{ ok: boolean }>),
+  importAssetsCsv: (csv: string) =>
+    af("/api/assets/import/csv", { method: "POST", headers: { "content-type": "text/csv" }, body: csv }).then(json<{ imported: number }>),
+  importAssetsSbom: (obj: unknown) =>
+    af("/api/assets/import/sbom", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(obj) }).then(json<{ imported: number; components: number }>),
+  exportAssetsUrl: () => "/api/assets/export",
+  assetMatches: () => af("/api/asset-matches").then(json<AssetMatch[]>),
+
+  // --- Phase 2: environment events ---
+  events: (params: { page?: number; pageSize?: number; matchedOnly?: boolean; kind?: string; q?: string } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.page != null) qs.set("page", String(params.page));
+    if (params.pageSize != null) qs.set("pageSize", String(params.pageSize));
+    if (params.matchedOnly) qs.set("matchedOnly", "true");
+    if (params.kind) qs.set("kind", params.kind);
+    if (params.q) qs.set("q", params.q);
+    return af(`/api/events?${qs}`).then(json<EventPage>);
+  },
+  ingestEventsText: (text: string) =>
+    af("/api/events", { method: "POST", headers: { "content-type": "text/plain" }, body: text }).then(json<EventIngestResult>),
+  ingestEventsJson: (obj: unknown) =>
+    af("/api/events", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(obj) }).then(json<EventIngestResult>),
+  eventStats: () => af("/api/events/stats").then(json<EventStats>),
+
+  // --- Phase 3: scanning ---
+  scanConfig: () => af("/api/scan/config").then(json<{ adapters: ScanAdapterInfo[] }>),
+  scanTargets: () => af("/api/scan/targets").then(json<ScanTarget[]>),
+  createScanTarget: (body: Partial<NewScanTarget>) =>
+    af("/api/scan/targets", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).then(json<ScanTarget>),
+  updateScanTarget: (id: string, patch: Partial<NewScanTarget>) =>
+    af(`/api/scan/targets/${id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(patch) }).then(json<{ ok: boolean }>),
+  deleteScanTarget: (id: string) => af(`/api/scan/targets/${id}`, { method: "DELETE" }).then(json<{ ok: boolean }>),
+  runScan: (body: { targetId?: string; target?: string; kind?: string; adapter?: string }) =>
+    af("/api/scan/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).then(json<Scan>),
+  scans: (limit = 50) => af(`/api/scans?limit=${limit}`).then(json<Scan[]>),
+  scan: (id: string) => af(`/api/scans/${id}`).then(json<{ scan: Scan; findings: ScanFinding[] }>),
+  findings: (params: { page?: number; pageSize?: number; scanId?: string; cve?: string; severity?: string; withCveOnly?: boolean } = {}) => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) if (v != null && v !== "" && v !== false) qs.set(k, String(v));
+    return af(`/api/findings?${qs}`).then(json<FindingPage>);
+  },
+  findingStats: () => af("/api/findings/stats").then(json<FindingStats>),
   /** Open the SSE stream. Returns the EventSource so callers can close it. */
   stream: (onUpdate: () => void, onError: () => void): EventSource => {
     const es = new EventSource(`/api/stream${streamToken()}`);

@@ -7,8 +7,10 @@ import {
   vulnerabilitiesToCsv, indicatorsToCsv, indicatorsToStix, indicatorsToBlocklist, indicatorsToSigma,
   indicatorsToYara, indicatorsToSnort, parseStixIndicators, typosquatVariants,
   ATTACK_TACTICS, tacticForTechnique,
+  NewAssetSchema, assetsToCsv, parseAssetsCsv, parseEvents, NewScanTargetSchema, type NewAsset,
 } from "@omnisight/shared";
 import { createRepository, composeDigest } from "@omnisight/db";
+import { runAndStoreScan, availableAdapters, type ScanRequest } from "@omnisight/scanner";
 import { roleAtLeast, type Role } from "@omnisight/shared";
 import { hashPassword, verifyPassword, signJwt, verifyJwt, type TokenPayload } from "./auth.js";
 import { llmConfigured, llmChat, coerceVulnFilters } from "./llm.js";
@@ -78,8 +80,11 @@ async function bootstrap() {
   }
 }
 
-const app = Fastify({ logger: true, bodyLimit: 20 * 1024 * 1024 }); // SBOMs can be large
+const app = Fastify({ logger: true, bodyLimit: 20 * 1024 * 1024 }); // SBOMs/log uploads can be large
 await app.register(cors, { origin: true });
+
+// Accept raw text bodies for CSV asset imports and plain-text log/event uploads.
+app.addContentTypeParser(["text/plain", "text/csv", "application/x-ndjson"], { parseAs: "string" }, (_req, body, done) => done(null, body));
 
 // --- Auth + RBAC gate (only active when AUTH_ENABLED) ---
 app.addHook("onRequest", async (req, reply) => {
@@ -585,11 +590,151 @@ app.get("/api/digest", async (req, reply) => {
   return digest;
 });
 
+// ===========================================================================
+// Phase 2 — Defensive monitoring: asset inventory
+// ===========================================================================
+app.get("/api/assets", async (req) => {
+  const q = req.query as Record<string, string | undefined>;
+  const page = Math.max(1, Number(q.page ?? 1));
+  const pageSize = Math.min(200, Math.max(1, Number(q.pageSize ?? 50)));
+  const result = await repo.listAssets({
+    limit: pageSize, offset: (page - 1) * pageSize,
+    q: q.q || undefined, kind: q.kind || undefined,
+    criticality: q.criticality || undefined, origin: q.origin || undefined,
+  });
+  return { ...result, page, pageSize };
+});
+app.post("/api/assets", async (req, reply) => {
+  const parsed = NewAssetSchema.safeParse(req.body);
+  if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+  const a = await repo.createAsset(parsed.data);
+  await repo.signalChange("assets");
+  return reply.status(201).send(a);
+});
+app.patch("/api/assets/:id", async (req) => {
+  await repo.updateAsset((req.params as { id: string }).id, (req.body ?? {}) as Partial<NewAsset>);
+  await repo.signalChange("assets");
+  return { ok: true };
+});
+app.delete("/api/assets/:id", async (req) => {
+  await repo.deleteAsset((req.params as { id: string }).id);
+  await repo.signalChange("assets");
+  return { ok: true };
+});
+app.get("/api/assets/export", async (_req, reply) => {
+  const { items } = await repo.listAssets({ limit: 100000 });
+  return reply
+    .header("content-type", "text/csv; charset=utf-8")
+    .header("content-disposition", 'attachment; filename="omnisight-assets.csv"')
+    .send(assetsToCsv(items));
+});
+app.post("/api/assets/import/csv", async (req, reply) => {
+  const body = req.body as unknown;
+  const csv = typeof body === "string" ? body : (body as { csv?: string })?.csv;
+  if (!csv?.trim()) return reply.status(400).send({ error: "CSV body required (send as text/csv or JSON { csv })" });
+  const assets = parseAssetsCsv(csv);
+  if (assets.length === 0) return reply.status(400).send({ error: "No asset rows parsed. A header row is required (name, vendor, product, version, cpe, …)." });
+  const n = await repo.upsertAssets(assets);
+  await repo.signalChange("assets");
+  return { imported: n };
+});
+app.post("/api/assets/import/sbom", async (req, reply) => {
+  const comps = parseSbom(req.body);
+  if (comps.length === 0) return reply.status(400).send({ error: "No purl-bearing components found (CycloneDX or SPDX with purls)." });
+  const assets: NewAsset[] = comps.map((c) => NewAssetSchema.parse({
+    name: c.name, kind: "software", product: c.name, version: c.version || null,
+    tags: [c.ecosystem], origin: "sbom",
+  }));
+  const n = await repo.upsertAssets(assets);
+  await repo.signalChange("assets");
+  return { imported: n, components: comps.length };
+});
+/** Vulnerabilities matched to inventory assets (CPE / vendor-product / term). */
+app.get("/api/asset-matches", async () => repo.assetMatches(300));
+
+// ===========================================================================
+// Phase 2 — Defensive monitoring: environment events (log / IOC matching)
+// ===========================================================================
+/** Ingest event(s): JSON object/array, NDJSON, or raw log text. Matches IOCs. */
+app.post("/api/events", async (req, reply) => {
+  const obs = parseEvents(req.body);
+  if (obs.length === 0) return reply.status(400).send({ error: "No observables (IP/domain/URL/hash) found in the submitted event(s)." });
+  const r = await repo.ingestEvents(obs);
+  await repo.signalChange("events");
+  return r;
+});
+app.get("/api/events", async (req) => {
+  const q = req.query as Record<string, string | undefined>;
+  const page = Math.max(1, Number(q.page ?? 1));
+  const pageSize = Math.min(500, Math.max(1, Number(q.pageSize ?? 100)));
+  const result = await repo.listEvents({
+    limit: pageSize, offset: (page - 1) * pageSize,
+    matchedOnly: q.matchedOnly === "true", kind: q.kind || undefined, q: q.q || undefined,
+  });
+  return { ...result, page, pageSize };
+});
+app.get("/api/events/stats", async () => repo.eventStats());
+
+// ===========================================================================
+// Phase 3 — Vulnerability scanning
+// ===========================================================================
+app.get("/api/scan/config", async () => ({ adapters: await availableAdapters() }));
+app.get("/api/scan/targets", async () => repo.listScanTargets());
+app.post("/api/scan/targets", async (req, reply) => {
+  const parsed = NewScanTargetSchema.safeParse(req.body);
+  if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+  const t = await repo.createScanTarget(parsed.data);
+  await repo.signalChange("scan");
+  return reply.status(201).send(t);
+});
+app.patch("/api/scan/targets/:id", async (req) => {
+  await repo.updateScanTarget((req.params as { id: string }).id, (req.body ?? {}) as Record<string, never>);
+  return { ok: true };
+});
+app.delete("/api/scan/targets/:id", async (req) => {
+  await repo.deleteScanTarget((req.params as { id: string }).id);
+  await repo.signalChange("scan");
+  return { ok: true };
+});
+/** Run a scan now: by saved target id, or an ad-hoc { target, kind, adapter }. */
+app.post("/api/scan/run", async (req, reply) => {
+  const b = (req.body ?? {}) as { targetId?: string; target?: string; kind?: string; adapter?: string };
+  let request: ScanRequest;
+  if (b.targetId) {
+    const t = await repo.getScanTarget(b.targetId);
+    if (!t) return reply.status(404).send({ error: "scan target not found" });
+    request = { targetId: t.id, target: t.target, kind: t.kind, adapter: t.adapter };
+  } else {
+    if (!b.target?.trim()) return reply.status(400).send({ error: "target or targetId required" });
+    request = { targetId: null, target: b.target.trim(), kind: b.kind === "url" ? "url" : "host", adapter: b.adapter || "builtin" };
+  }
+  return runAndStoreScan(repo, request, { timeoutMs: 1500 });
+});
+app.get("/api/scans", async (req) => repo.listScans(Number((req.query as { limit?: string }).limit ?? 50)));
+app.get("/api/scans/:id", async (req, reply) => {
+  const scan = await repo.getScan((req.params as { id: string }).id);
+  if (!scan) return reply.status(404).send({ error: "not found" });
+  const { items } = await repo.listFindings({ scanId: scan.id, limit: 1000 });
+  return { scan, findings: items };
+});
+app.get("/api/findings", async (req) => {
+  const q = req.query as Record<string, string | undefined>;
+  const page = Math.max(1, Number(q.page ?? 1));
+  const pageSize = Math.min(500, Math.max(1, Number(q.pageSize ?? 100)));
+  const result = await repo.listFindings({
+    limit: pageSize, offset: (page - 1) * pageSize,
+    scanId: q.scanId || undefined, cve: q.cve || undefined,
+    severity: q.severity || undefined, withCveOnly: q.withCveOnly === "true",
+  });
+  return { ...result, page, pageSize };
+});
+app.get("/api/findings/stats", async () => repo.findingStats());
+
 app.get("/api/vulnerabilities", async (req) => {
   const q = req.query as Record<string, string | undefined>;
   const page = Math.max(1, Number(q.page ?? 1));
   const pageSize = Math.min(200, Math.max(1, Number(q.pageSize ?? 50)));
-  const terms = q.myStack === "true" ? await repo.listWatchlist() : undefined;
+  const terms = q.myStack === "true" ? await repo.stackTerms() : undefined;
   const result = await repo.page({
     limit: pageSize,
     offset: (page - 1) * pageSize,
@@ -608,7 +753,7 @@ app.get("/api/vulnerabilities", async (req) => {
 
 app.get("/api/vulnerabilities/export", async (req, reply) => {
   const q = req.query as Record<string, string | undefined>;
-  const terms = q.myStack === "true" ? await repo.listWatchlist() : undefined;
+  const terms = q.myStack === "true" ? await repo.stackTerms() : undefined;
   const { items } = await repo.page({
     limit: 10000, offset: 0,
     minRisk: q.minRisk ? Number(q.minRisk) : undefined,

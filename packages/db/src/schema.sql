@@ -210,3 +210,107 @@ CREATE TABLE IF NOT EXISTS audit_log (
   status     INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log (at DESC);
+
+-- ===========================================================================
+-- Phase 2 — Defensive monitoring
+-- ===========================================================================
+
+-- Asset inventory: the software/hosts/services the defender runs. Incoming
+-- intel is matched against these ("you run X, this KEV hits X"). The flat
+-- "My Stack" watchlist is the lightweight view; this is the structured store.
+CREATE TABLE IF NOT EXISTS assets (
+  id          TEXT PRIMARY KEY,
+  name        TEXT NOT NULL,
+  kind        TEXT NOT NULL DEFAULT 'software' CHECK (kind IN ('host','service','software','cloud','network','other')),
+  vendor      TEXT,
+  product     TEXT,
+  version     TEXT,
+  cpe         TEXT,
+  ip          TEXT,
+  hostname    TEXT,
+  owner       TEXT,
+  criticality TEXT NOT NULL DEFAULT 'medium' CHECK (criticality IN ('low','medium','high','critical')),
+  tags        JSONB NOT NULL DEFAULT '[]',
+  origin      TEXT NOT NULL DEFAULT 'manual' CHECK (origin IN ('manual','csv','sbom','scan')),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_assets_vendor  ON assets (vendor);
+CREATE INDEX IF NOT EXISTS idx_assets_product ON assets (product);
+CREATE INDEX IF NOT EXISTS idx_assets_crit    ON assets (criticality);
+
+-- Environment events: observables seen in the defender's own logs/sensors
+-- (push API, file upload, syslog), matched against tracked indicators.
+CREATE TABLE IF NOT EXISTS monitor_events (
+  id             TEXT PRIMARY KEY,
+  sensor         TEXT NOT NULL DEFAULT 'push',
+  kind           TEXT NOT NULL CHECK (kind IN ('ip','domain','url','hash')),
+  value          TEXT NOT NULL,
+  host           TEXT,
+  observed_at    TIMESTAMPTZ,
+  raw            TEXT,
+  matched        BOOLEAN NOT NULL DEFAULT FALSE,
+  matched_source TEXT,
+  malware        TEXT,
+  severity       TEXT NOT NULL DEFAULT 'info' CHECK (severity IN ('info','low','medium','high','critical')),
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_events_created ON monitor_events (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_matched ON monitor_events (matched);
+CREATE INDEX IF NOT EXISTS idx_events_value   ON monitor_events (value);
+
+-- ===========================================================================
+-- Phase 3 — Vulnerability scanning
+-- ===========================================================================
+
+-- A host/URL the scanner is configured to assess.
+CREATE TABLE IF NOT EXISTS scan_targets (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,
+  target       TEXT NOT NULL,
+  kind         TEXT NOT NULL DEFAULT 'host' CHECK (kind IN ('host','url')),
+  adapter      TEXT NOT NULL DEFAULT 'builtin',
+  enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+  schedule     TEXT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_scan_at TIMESTAMPTZ
+);
+
+-- One scan run against one target.
+CREATE TABLE IF NOT EXISTS scans (
+  id            TEXT PRIMARY KEY,
+  target_id     TEXT REFERENCES scan_targets(id) ON DELETE SET NULL,
+  target        TEXT NOT NULL,
+  adapter       TEXT NOT NULL DEFAULT 'builtin',
+  status        TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','done','error')),
+  started_at    TIMESTAMPTZ,
+  finished_at   TIMESTAMPTZ,
+  finding_count INTEGER NOT NULL DEFAULT 0,
+  open_ports    INTEGER NOT NULL DEFAULT 0,
+  cve_count     INTEGER NOT NULL DEFAULT 0,
+  error         TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_scans_created ON scans (created_at DESC);
+
+-- A single finding produced by a scan; feeds the correlation engine via `cve`.
+CREATE TABLE IF NOT EXISTS scan_findings (
+  id         TEXT PRIMARY KEY,
+  scan_id    TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+  target     TEXT NOT NULL,
+  host       TEXT,
+  port       INTEGER,
+  service    TEXT,
+  product    TEXT,
+  version    TEXT,
+  cpe        TEXT,
+  cve        TEXT,
+  severity   TEXT NOT NULL DEFAULT 'info' CHECK (severity IN ('info','low','medium','high','critical')),
+  title      TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  evidence   TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_findings_scan ON scan_findings (scan_id);
+CREATE INDEX IF NOT EXISTS idx_findings_cve  ON scan_findings (cve);
+CREATE INDEX IF NOT EXISTS idx_findings_sev  ON scan_findings (severity);

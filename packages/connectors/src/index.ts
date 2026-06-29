@@ -172,6 +172,28 @@ const seedSourcesRaw: Omit<Source, "reliability">[] = [
     requiresAuth: false,
     config: {},
   },
+  {
+    id: "arstechnica-security",
+    name: "Ars Technica — Security",
+    kind: "rss",
+    signalType: "advisory",
+    url: "https://feeds.arstechnica.com/arstechnica/security",
+    schedule: "0 */3 * * *",
+    enabled: true,
+    requiresAuth: false,
+    config: {},
+  },
+  {
+    id: "bleepingcomputer",
+    name: "BleepingComputer",
+    kind: "rss",
+    signalType: "advisory",
+    url: "https://www.bleepingcomputer.com/feed/",
+    schedule: "0 */3 * * *",
+    enabled: true,
+    requiresAuth: false,
+    config: {},
+  },
 ];
 
 // Admiralty-style source grades: A authoritative · B usually reliable · C fairly.
@@ -179,6 +201,7 @@ const SEED_RELIABILITY: Record<string, Source["reliability"]> = {
   "cisa-kev": "A", nvd: "A", "mitre-atlas": "A",
   threatfox: "B", otx: "C", pulsedive: "B",
   "securityweek-ai": "C", thehackernews: "C", darkreading: "C",
+  "arstechnica-security": "C", bleepingcomputer: "C",
 };
 
 export const seedSources: Source[] = seedSourcesRaw.map((s) => ({

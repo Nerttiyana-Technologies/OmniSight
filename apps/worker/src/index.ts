@@ -1,10 +1,13 @@
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import dgram from "node:dgram";
+import net from "node:net";
 import { Queue, Worker, type Job } from "bullmq";
 import IORedis from "ioredis";
 import nodemailer from "nodemailer";
 import { createRepository, composeDigest } from "@omnisight/db";
-import type { Digest, Vulnerability } from "@omnisight/shared";
+import { parseEvents, type Digest, type Vulnerability } from "@omnisight/shared";
+import { runAndStoreScan } from "@omnisight/scanner";
 import {
   resolveConnector, resolveIndicatorConnector, resolveAdvisoryConnector,
   seedSources, fetchEpss, fetchNvdCvss, fetchGeo, sleep, fetchBreaches,
@@ -95,6 +98,28 @@ async function scheduleAll() {
     await queue.add("digest", {}, { delay: 30000, jobId: "now-digest", removeOnComplete: true });
   }
 
+  // Scheduled vulnerability scans (Phase 3): each enabled target with a cron.
+  const targets = await repo.listScanTargets().catch(() => []);
+  let scheduledScans = 0;
+  for (const t of targets) {
+    if (!t.enabled || !t.schedule) continue;
+    await queue.add("scan", { targetId: t.id }, {
+      repeat: { pattern: t.schedule },
+      jobId: `repeat:scan:${t.id}`,
+      removeOnComplete: 20,
+      removeOnFail: 20,
+    });
+    scheduledScans++;
+  }
+
+  // Environment-event retention prune (daily at 04:30).
+  await queue.add("events-decay", {}, {
+    repeat: { pattern: "30 4 * * *" },
+    jobId: "repeat:events-decay",
+    removeOnComplete: 5,
+    removeOnFail: 5,
+  });
+
   // Breach exposure check daily at 05:00 (only does work when HIBP_DOMAINS set).
   if ((process.env.HIBP_DOMAINS ?? "").trim()) {
     await queue.add("breaches", {}, {
@@ -106,7 +131,49 @@ async function scheduleAll() {
     await queue.add("breaches", {}, { delay: 25000, jobId: "now-breaches", removeOnComplete: true });
   }
 
-  console.log(`[worker] scheduled ${sources.length} source(s) + enrichment + daily brief`);
+  console.log(`[worker] scheduled ${sources.length} source(s) + enrichment + daily brief + ${scheduledScans} scan target(s)`);
+}
+
+/** Strip an RFC3164/5424 priority prefix (`<13>`) and version/timestamp noise. */
+function stripSyslog(line: string): string {
+  return line.replace(/^<\d+>\d*\s*/, "").trim();
+}
+
+/** Ingest one syslog line: extract observables, match against indicators. */
+async function ingestSyslogLine(line: string): Promise<void> {
+  const msg = stripSyslog(line);
+  if (!msg) return;
+  const obs = parseEvents(msg).map((o) => ({ ...o, sensor: "syslog" }));
+  if (obs.length === 0) return;
+  try {
+    const r = await repo.ingestEvents(obs);
+    if (r.inserted) await repo.signalChange("events");
+    if (r.matched) console.log(`[worker] syslog: ${r.matched} IOC match(es) in ${r.inserted} observable(s)`);
+  } catch (e) {
+    console.warn(`[worker] syslog ingest failed: ${(e as Error).message}`);
+  }
+}
+
+/** Opt-in syslog listener (UDP + TCP) for environment-event IOC matching. */
+function startSyslog(): void {
+  if (process.env.SYSLOG_ENABLED !== "true") return;
+  const port = Number(process.env.SYSLOG_PORT ?? 5514);
+  const udp = dgram.createSocket("udp4");
+  udp.on("message", (m) => { void ingestSyslogLine(m.toString()); });
+  udp.on("error", (e) => console.warn(`[worker] syslog UDP error: ${e.message}`));
+  udp.bind(port, () => console.log(`[worker] syslog UDP listening on :${port}`));
+  const tcp = net.createServer((sock) => {
+    let buf = "";
+    sock.on("data", (d) => {
+      buf += d.toString();
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
+      for (const l of lines) void ingestSyslogLine(l);
+    });
+    sock.on("error", () => { /* client reset */ });
+  });
+  tcp.on("error", (e) => console.warn(`[worker] syslog TCP error: ${e.message}`));
+  tcp.listen(port, () => console.log(`[worker] syslog TCP listening on :${port}`));
 }
 
 /** Shared SMTP transport (null when SMTP isn't configured). */
@@ -234,7 +301,7 @@ async function runAlerts(): Promise<void> {
   const floor = Math.min(...rules.map((r) => r.minRisk));
   const candidates = await repo.pendingRuleCandidates(floor);
   if (candidates.length === 0) return;
-  const terms = await repo.listWatchlist();
+  const terms = await repo.stackTerms();
   const alerted = new Set<string>();
   let fired = 0;
 
@@ -353,10 +420,27 @@ async function runBreaches(): Promise<void> {
 
 new Worker(
   QUEUE,
-  async (job: Job<{ sourceId?: string }>) => {
+  async (job: Job<{ sourceId?: string; targetId?: string }>) => {
     if (job.name === "enrich") {
       await runEnrichment();
       return { enriched: true };
+    }
+    if (job.name === "scan") {
+      const target = job.data.targetId ? await repo.getScanTarget(job.data.targetId) : null;
+      if (!target) return { ok: false };
+      const scan = await runAndStoreScan(
+        repo,
+        { targetId: target.id, target: target.target, kind: target.kind, adapter: target.adapter },
+        { timeoutMs: 1500 },
+      );
+      console.log(`[worker] scan ${target.name}: ${scan.status} (${scan.findingCount} finding(s), ${scan.cveCount} CVE)`);
+      return { ok: true };
+    }
+    if (job.name === "events-decay") {
+      const days = Number(process.env.EVENTS_PRUNE_DAYS ?? 30);
+      const n = await repo.pruneEvents(days);
+      if (n > 0) { await repo.signalChange("events"); console.log(`[worker] events-decay: pruned ${n} event(s) older than ${days}d`); }
+      return { ok: true };
     }
     if (job.name === "breaches") {
       await runBreaches();
@@ -431,4 +515,5 @@ new Worker(
 );
 
 await scheduleAll();
+startSyslog();
 console.log("[worker] running");
