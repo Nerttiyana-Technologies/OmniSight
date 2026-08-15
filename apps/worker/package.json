@@ -14,9 +14,9 @@
     "@omnisight/db": "workspace:*",
     "@omnisight/scanner": "workspace:*",
     "@omnisight/shared": "workspace:*",
-    "bullmq": "^5.34.0",
-    "ioredis": "^5.4.1",
-    "nodemailer": "^9.0.1"
+    "bullmq": "^6.1.0",
+    "ioredis": "^6.0.0",
+    "nodemailer": "^9.0.5"
   },
   "devDependencies": {
     "@types/nodemailer": "^6.4.17",
