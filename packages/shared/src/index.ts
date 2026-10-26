@@ -151,7 +151,7 @@ export function riskBand(score: number): "critical" | "high" | "medium" | "low" 
   return "low";
 }
 
-// --- Exporters (interop: push to SIEM / firewall / OpenCTI / MISP) ---------
+// --- Exporters (interop: push to SIEM / firewall / threat-intel platform) ---------
 
 function csvCell(v: unknown): string {
   const s = v == null ? "" : String(v);
@@ -210,7 +210,7 @@ function stixPattern(i: Indicator): string | null {
   }
 }
 
-/** STIX 2.1 bundle of indicator SDOs — importable into OpenCTI, MISP, etc. */
+/** STIX 2.1 bundle of indicator SDOs — importable into threat-intel platforms that accept STIX 2.1. */
 export function indicatorsToStix(items: Indicator[]): string {
   const now = new Date().toISOString();
   const objects = items

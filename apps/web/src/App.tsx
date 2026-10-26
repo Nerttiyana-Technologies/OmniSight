@@ -1206,7 +1206,7 @@ function IndicatorGrid({ reloadKey, sources, onEnrich, canWrite }: { reloadKey: 
         <button className="chip" onClick={() => download(api.exportIndicatorUrl(exportParams(), "csv"))} title="Download as CSV">
           <Download size={14} /> CSV
         </button>
-        <button className="chip" onClick={() => download(api.exportIndicatorUrl(exportParams(), "stix"))} title="STIX 2.1 bundle (OpenCTI/MISP)">
+        <button className="chip" onClick={() => download(api.exportIndicatorUrl(exportParams(), "stix"))} title="STIX 2.1 bundle (for threat-intel platforms)">
           STIX
         </button>
         <button className="chip" onClick={() => download(api.exportIndicatorUrl(exportParams(), "blocklist"))} title="Plain blocklist for firewalls/IDS">

@@ -18,12 +18,12 @@
 
 ---
 
-OmniSight is the lightweight, opinionated alternative to heavyweight platforms like OpenCTI/MISP for teams who want to
+OmniSight is the lightweight, opinionated alternative to heavyweight threat-intel platforms for teams who want to
 **see what's on fire right now**, then drill in — without the deployment tax. It runs with **zero API keys** on public
 feeds (optional keys unlock premium sources), starts with a single `docker compose up`, and is permissively licensed
 (Apache-2.0) for maximum adoption and contribution.
 
-> Think *"WorldMonitor for cyber"*: fast, glanceable, correlation-first — and now extended from a threat-intel feed
+> Think *a situational-awareness dashboard, built for cyber*: fast, glanceable, correlation-first — and now extended from a threat-intel feed
 > into a full **detect → match → scan** loop across all three roadmap phases.
 
 ## Table of contents
@@ -64,8 +64,8 @@ data:
 ## Why OmniSight
 
 The open-source threat-intel space splits into two camps with a gap in the middle: **heavy enterprise platforms**
-(OpenCTI, MISP, TheHive) that are powerful but steep to deploy and run, and **lightweight feed tools** that are easy but
-narrow. OmniSight targets the gap — a modern, permissively-licensed, TypeScript platform that does WorldMonitor's
+that are powerful but steep to deploy and run, and **lightweight feed tools** that are easy but
+narrow. OmniSight targets the gap — a modern, permissively-licensed, TypeScript platform that does the
 situational-awareness job for cyber:
 
 - **Correlation-first, not just aggregation.** The differentiator is meaningful cross-stream correlation and a composite
@@ -280,7 +280,7 @@ A selection of the REST surface (all under `/api`):
 ## Exports & interop
 
 Both grids export the current filtered view. Vulnerabilities → **CSV**. Indicators → **CSV**, **STIX 2.1** bundle
-(importable into OpenCTI/MISP), a plain **blocklist** (IPs/domains/URLs/hashes) for firewalls/IDS, **Sigma**, **YARA**, and
+(importable into threat-intel platforms that accept STIX), a plain **blocklist** (IPs/domains/URLs/hashes) for firewalls/IDS, **Sigma**, **YARA**, and
 **Snort/Suricata** rules. The asset inventory exports to **CSV**. OmniSight pushes intel into the rest of your stack
 rather than trapping it.
 
